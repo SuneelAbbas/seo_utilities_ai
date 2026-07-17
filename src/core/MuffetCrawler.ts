@@ -112,48 +112,40 @@ function escapeRegex(str: string): string {
 }
 
 /**
- * Build the muffet --include regex pattern that only includes URLs
- * belonging to the given hostname.
+ * Build a COMBINED exclude regex pattern for muffet's --exclude flag.
  *
- * Uses the positive -i (include) flag since muffet uses Go's RE2
- * regex engine which does NOT support negative lookaheads.
+ * Muffet does NOT have an --include flag — only -e/--exclude.
+ * To restrict crawling to a single hostname AND exclude assets, we
+ * merge both concerns into ONE --exclude pattern using alternation.
  *
- * Example for "patchoulibeautylaser.ca":
- *   https?://(www\.)?patchoulibeautylaser\.ca
+ * The hostname restriction uses a negative lookahead to exclude any
+ * URL that does NOT start with the target hostname:
+ *   ^(?!https?://(www\.)?hostname)
  *
- * Exported so routes / callers can compute the pattern without
- * needing to duplicate the logic.
+ * If excludeAssets is true, asset/wp patterns are appended via |.
+ *
+ * Returns undefined if no filtering is needed (both internalOnly=false
+ * and excludeAssets=false).
  */
-export function buildInternalOnlyIncludePattern(hostname: string): string {
-  // Strip leading www. so we can add (www\.)? optionally
-  // e.g. "www.example.com" → stripped "example.com" → pattern matches both
-  //      "https://www.example.com" and "https://example.com"
+export function buildCombinedExcludePattern(
+  hostname: string,
+  excludeAssets: boolean,
+): string | undefined {
   const stripped = hostname.replace(/^www\./i, '');
   const escaped = escapeRegex(stripped);
-  return `https?://(www\\.)?${escaped}`;
-}
 
-/**
- * Build the muffet --exclude regex pattern that excludes:
- *   1. Static asset file extensions (CSS, JS, fonts, images, data files, sourcemaps)
- *   2. WordPress system paths (wp-json, wp-content, wp-includes, wp-admin)
- *   3. WordPress system files (xmlrpc.php)
- *   4. Static asset directories (_static)
- *   5. Feed / comment-feed URLs
- *
- * Uses RE2-compatible syntax (no negative lookahead, no backreferences).
- * Combined with alternation (`|`) so any one match excludes the URL.
- *
- * Exported so routes / callers can compute the pattern without
- * duplicating the logic.
- */
-export function buildAssetExcludePattern(): string {
+  // Negative lookahead: exclude URLs NOT on the target hostname.
+  // This effectively acts as an "include only this hostname" rule.
+  const hostnameRestriction = `^(?!https?://(www\\.)?${escaped})`;
+
+  if (!excludeAssets) {
+    return hostnameRestriction;
+  }
+
   const assetExt = '\\.(css|js|mjs|woff2?|ttf|eot|svg|png|jpe?g|gif|webp|ico|json|xml|map)(\\?.*)?$';
-  const wpPaths = '/wp-json/|/wp-content/|/wp-includes/|/wp-admin/';
-  const wpFiles = '/xmlrpc\\.php';
-  const staticPaths = '/_static/';
-  const feeds = '/feed/?$|/comments/feed/?$';
-  return `${assetExt}|${wpPaths}|${wpFiles}|${staticPaths}|${feeds}`;
+  const wpPaths = '/wp-json/|/wp-content/|/wp-includes/|/wp-admin/|/xmlrpc\\.php|/_static/|/feed/?$|/comments/feed/?$';
+
+  return `(${hostnameRestriction})|(${assetExt})|(${wpPaths})`;
 }
 
 /**
@@ -295,24 +287,21 @@ export class MuffetCrawler {
       // 1. Sanitize the URL
       const url = sanitizeUrl(options.url);
 
-      // 2. Extract hostname for internal-only filtering
+      // 2. Extract hostname for combined exclude pattern
       const hostname = new URL(url).hostname;
-      const includePattern = internalOnly
-        ? buildInternalOnlyIncludePattern(hostname)
-        : undefined;
 
-      // 2b. Build asset exclude pattern
-      const excludePattern = excludeAssets
-        ? buildAssetExcludePattern()
-        : undefined;
+      // 2a. Build combined exclude pattern — muffet has NO --include flag,
+      //     only -e/--exclude. The hostname restriction is baked into the
+      //     exclude pattern via negative lookahead.
+      const excludePattern = buildCombinedExcludePattern(hostname, excludeAssets);
 
       // 3. Build arguments — no shell, just an argv array
       //    IMPORTANT: Flags MUST use Unix-style --dash prefix (not /slash).
       //    Muffet is a Go binary running on Linux — it expects -c, -f, --timeout, etc.
+      //    NOTE: muffet has NO --include flag. Only --exclude (-e).
       const args: string[] = [];
 
       args.push('-c', String(concurrency), '-f', 'json', '--timeout', String(pageTimeout));
-      if (includePattern) args.push('--include', includePattern);
       if (excludePattern) args.push('--exclude', excludePattern);
       args.push(url);
 
@@ -320,7 +309,6 @@ export class MuffetCrawler {
       console.log('');
       console.log('══════════════════════════════════════════════════════');
       console.log('[MUFFET] Executing:', MUFFET_BINARY_PATH, JSON.stringify(args));
-      console.log('[MUFFET] includePattern:', includePattern ?? '(none)');
       console.log('[MUFFET] excludePattern:', excludePattern ?? '(none)');
       console.log('══════════════════════════════════════════════════════');
       console.log('');
@@ -375,9 +363,12 @@ export class MuffetCrawler {
       let results = this.parseMuffetOutput(stdout);
 
       // 5. Post-process: apply additional filtering (safety net)
+      //    Even though the --exclude pattern should handle both hostname
+      //    restriction and asset exclusion, this post-processing ensures
+      //    correctness in case the regex has edge cases.
       if (results.length > 0) {
         // 5a. Filter out external domains if internalOnly is true
-        //     (safety net in case the -i include flag misses some)
+        //     (safety net in case the combined exclude pattern misses some)
         if (internalOnly) {
           results = results.filter((r) => {
             try {
@@ -430,20 +421,25 @@ export class MuffetCrawler {
   // ─── Static arg builder (shared by crawl + spawnStream) ──────────
 
   /**
-   * Build the muffet CLI argument array based on platform.
+   * Build the muffet CLI argument array for streaming mode.
+   *
+   * muffet has NO --include flag — only -e/--exclude. The include
+   * pattern from the original design was replaced by a combined
+   * exclude pattern that uses negative lookahead for hostname
+   * restriction merged with asset/wp exclusion patterns.
+   *
+   * If excludePattern is undefined, no --exclude flag is added.
    */
   static buildArgs(
     url: string,
     concurrency: number,
     pageTimeout: number,
-    includePattern?: string,
     excludePattern?: string,
   ): string[] {
     const args: string[] = [];
 
     // Unix-style flags for Linux muffet binary
     args.push('-c', String(concurrency), '--verbose', '--timeout', String(pageTimeout));
-    if (includePattern) args.push('--include', includePattern);
     if (excludePattern) args.push('--exclude', excludePattern);
     args.push(url);
 
@@ -458,19 +454,21 @@ export class MuffetCrawler {
    *
    * Each line on stdout represents a URL being checked.
    * Process will self-terminate after `processTimeoutMs` if not finished.
+   *
+   * @param excludePattern - Combined exclude regex (hostname restriction +
+   *                         asset/wp exclusion). Passed via --exclude. If
+   *                         undefined, no --exclude flag is added.
    */
   static spawnStream(
     url: string,
     concurrency: number = MuffetCrawler.DEFAULT_CONCURRENCY,
     pageTimeout: number = MuffetCrawler.DEFAULT_PAGE_TIMEOUT,
     processTimeoutMs: number = MuffetCrawler.DEFAULT_PROCESS_TIMEOUT_MS,
-    includePattern?: string,
     excludePattern?: string,
   ): ChildProcess {
-    const args = MuffetCrawler.buildArgs(url, concurrency, pageTimeout, includePattern, excludePattern);
+    const args = MuffetCrawler.buildArgs(url, concurrency, pageTimeout, excludePattern);
     // ── DEBUG: log the spawned command ─────────────────────────────
     console.log('[MUFFET-spawnStream] Spawning:', MUFFET_BINARY_PATH, args.join(' '));
-    console.log('[MUFFET-spawnStream] includePattern:', includePattern ?? '(none)');
     console.log('[MUFFET-spawnStream] excludePattern:', excludePattern ?? '(none)');
     const child = spawn(MUFFET_BINARY_PATH, args, {
       timeout: processTimeoutMs,

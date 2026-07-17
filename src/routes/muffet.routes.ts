@@ -2,8 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import {
   type MuffetResult,
   MuffetCrawler,
-  buildInternalOnlyIncludePattern,
-  buildAssetExcludePattern,
+  buildCombinedExcludePattern,
   filterPageRoutes,
 } from '../core/MuffetCrawler.js';
 
@@ -151,28 +150,24 @@ router.get('/stream', async (req: Request, res: Response) => {
       timestamp: startTime,
     });
 
-    // ── Build include/exclude patterns ────────────────────────────
+    // ── Build combined exclude pattern ───────────────────────────
+    //     muffet has NO --include flag — only -e/--exclude.
+    //     The hostname restriction is baked into the exclude pattern
+    //     via negative lookahead.
     const hostname = new URL(url).hostname;
-    const includePattern = internalOnly
-      ? buildInternalOnlyIncludePattern(hostname)
-      : undefined;
-    const excludePattern = excludeAssets
-      ? buildAssetExcludePattern()
-      : undefined;
+    const combinedExcludePattern = buildCombinedExcludePattern(hostname, excludeAssets);
 
-    // ── DEBUG: log patterns before spawning ──────────────────────
+    // ── DEBUG: log pattern before spawning ───────────────────────
     console.log('');
     console.log('══════════════════════════════════════════════════════');
     console.log('[MUFFET-SSE] URL:', url);
-    console.log('[MUFFET-SSE] internalOnly:', internalOnly);
     console.log('[MUFFET-SSE] excludeAssets:', excludeAssets);
-    console.log('[MUFFET-SSE] includePattern:', includePattern ?? '(none)');
-    console.log('[MUFFET-SSE] excludePattern:', excludePattern ?? '(none)');
+    console.log('[MUFFET-SSE] combinedExcludePattern:', combinedExcludePattern ?? '(none — no --exclude flag)');
     console.log('══════════════════════════════════════════════════════');
     console.log('');
 
     // ── Spawn muffet process ─────────────────────────────────────
-    const child = MuffetCrawler.spawnStream(url, undefined, undefined, undefined, includePattern, excludePattern);
+    const child = MuffetCrawler.spawnStream(url, undefined, undefined, undefined, combinedExcludePattern);
     const stdoutLines: string[] = [];
     let urlsChecked = 0;
     let currentUrl = '';

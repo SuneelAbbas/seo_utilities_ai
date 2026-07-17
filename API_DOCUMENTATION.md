@@ -3,6 +3,8 @@
 > **Base URL:** `http://localhost:3000` (configurable via `PORT` env var)
 >
 > **Project:** `D:\React\seo-utilities-api`
+>
+> **Deployment:** StackHost free tier — see [StackHost Deployment](#stackhost-deployment)
 
 ---
 
@@ -15,27 +17,39 @@
 5. [Muffet Crawler APIs](#muffet-crawler-apis)
    - [POST /api/muffet/crawl](#post-apimuffetcrawl)
    - [GET /api/muffet/stream](#get-apimuffetstream)
-6. [AI Citation Tracker API](#ai-citation-tracker-api)
+6. [Smart Crawl Orchestrator API](#smart-crawl-orchestrator-api)
+   - [POST /api/orchestrator/crawl](#post-apiorchestratorcrawl)
+   - [GET /api/orchestrator/stream](#get-apiorchestratorstream)
+   - [GET /api/orchestrator/stats](#get-apiorchestratorstats)
+7. [AI Citation Tracker API](#ai-citation-tracker-api)
    - [POST /api/citation/check](#post-apicitationcheck)
-7. [Error Handling](#error-handling)
-8. [Internal Architecture](#internal-architecture)
-9. [Appendix: Types & Interfaces](#appendix-types--interfaces)
+8. [Error Handling](#error-handling)
+9. [Internal Architecture](#internal-architecture)
+10. [External Binary: muffet](#external-binary-muffet)
+    - [Binary Installation](#binary-installation)
+    - [Build Chain](#build-chain)
+    - [Flag Syntax](#flag-syntax)
+11. [StackHost Deployment](#stackhost-deployment)
+12. [Appendix: Types & Interfaces](#appendix-types--interfaces)
+13. [Environment Variables](#environment-variables)
+14. [Project Structure](#project-structure)
 
 ---
 
 ## Overview
 
-This API combines **two SEO utilities** into a single Express.js server:
+This API combines **three SEO utilities** into a single Express.js server:
 
 | Feature | Description | Route Prefix |
 |---------|-------------|--------------|
 | 🔗 **Muffet Crawler** | Fast website link-checking using the Go-based [`muffet`](https://github.com/raviqqe/muffet) CLI tool. Crawls a website and returns all linked URLs with HTTP status codes. Supports both JSON (POST) and real-time SSE streaming (GET). | `/api/muffet` |
+| 🧠 **Smart Crawl Orchestrator** | Higher-level crawl orchestrator that coordinates multi-page crawling with real-time SSE progress and client-disconnect cancellation via `AbortController`. | `/api/orchestrator` |
 | 🤖 **AI Citation Tracker** | AI-powered brand visibility analysis. Generates search query variations from a category + location, runs them through an AI model's web search capability, parses responses to detect company mentions, and produces a visibility score/grade. | `/api/citation` |
 
 **Tech Stack:**
-- **Runtime:** Node.js ≥ 18 (TypeScript)
+- **Runtime:** Node.js ≥ 18 (TypeScript, ESM)
 - **Framework:** Express 5.x
-- **External CLI:** [`muffet`](https://github.com/raviqqe/muffet) v2.x (Go binary, must be installed separately)
+- **External CLI:** [`muffet`](https://github.com/raviqqe/muffet) v2.11.5 (Go binary, installed to project-local `./bin/muffet`)
 - **AI Providers:** OpenAI (implemented), Anthropic Claude (stub), Google Gemini (stub)
 
 ---
@@ -66,7 +80,7 @@ curl -H "x-api-key: your-secret-key" http://localhost:3000/api/muffet/crawl
 
 ## Rate Limiting
 
-The Muffet crawl endpoints have an **adaptive rate limiter** implemented via [`express-rate-limit`](D:\React\seo-utilities-api\src\server.ts:75).
+The Muffet crawl endpoints and Orchestrator endpoints have an **adaptive rate limiter** implemented via [`express-rate-limit`](D:\React\seo-utilities-api\src\server.ts:75).
 
 ### Load Detection Logic
 
@@ -108,7 +122,7 @@ No authentication required. Returns server status and current timestamp.
 
 ### Source
 
-[`src/server.ts:105`](D:\React\seo-utilities-api\src\server.ts:105)
+[`src/server.ts:106`](D:\React\seo-utilities-api\src\server.ts:106)
 
 ---
 
@@ -203,11 +217,11 @@ curl -X POST http://localhost:3000/api/muffet/crawl \
 
 1. **[URL Validation](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:55)** — Validates URL format via `isValidUrl()`.
 2. **[Semaphore Acquisition](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:29)** — Acquires a concurrency slot (max **2** concurrent muffet processes). If at capacity, the request is queued.
-3. **[Crawl Execution](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:355)** — Calls [`MuffetCrawler.crawl()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:273) which:
-   - Sanitizes the URL ([`sanitizeUrl()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:64)) — blocks shell metacharacters.
+3. **[Crawl Execution](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:355)** — Calls [`MuffetCrawler.crawl()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:282) which:
+   - Sanitizes the URL ([`sanitizeUrl()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:73)) — blocks shell metacharacters.
    - Builds include/exclude regex patterns for muffet's `--include` / `--exclude` flags.
-   - Executes `muffet` via [`execFile()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:318) (safe — no shell invocation) with JSON output format.
-   - Parses muffet's JSON output ([`parseMuffetOutput()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:496)) — handles both array and tree JSON formats.
+   - Executes muffet via [`execFile()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:331) (safe — no shell invocation) with JSON output format.
+   - Parses muffet's JSON output ([`parseMuffetOutput()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:509)) — handles both array and tree JSON formats.
    - Post-filters results (internal hostname check + asset exclusion as safety net).
 4. **[Semaphore Release](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:364)** — Releases the slot, waking any queued request.
 5. **[Response](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:367)** — Returns the parsed `MuffetCrawlResponse`.
@@ -268,7 +282,7 @@ curl -N -H "x-api-key: your-secret-key" \
 1. **[URL Validation](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:101)** — Validates URL format.
 2. **[Semaphore Acquisition](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:112)** — Acquires concurrency slot (max 2).
 3. **[SSE Headers](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:115)** — Sets `Content-Type: text/event-stream`, `Cache-Control: no-cache`, etc. Disables socket timeout.
-4. **[Spawn muffet](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:175)** — Calls [`MuffetCrawler.spawnStream()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:449) which uses [`spawn()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:462) with verbose human-readable output (not JSON).
+4. **[Spawn muffet](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:175)** — Calls [`MuffetCrawler.spawnStream()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:462) which uses [`spawn()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:475) with verbose human-readable output (not JSON).
 5. **[Parse stdout line-by-line](D:\React\seo-utilities-api\src\routes\muffet.routes.ts:182)** — Each chunk is split into lines:
    - Non-tab lines → URL being checked → emits `progress` event.
    - Tab-indented lines (`\t200\thttps://...`) → result entry → emits `result` event.
@@ -283,8 +297,161 @@ curl -N -H "x-api-key: your-secret-key" \
 |----------|-------------------------|--------------------------|
 | Response style | Single JSON response | Real-time SSE stream |
 | Use case | Simple integration, server-side calls | Progress bars, live dashboards |
-| Output format | JSON (muffet `-json` flag) | Verbose human-readable (parsed) |
+| Output format | JSON (muffet `-f json` flag) | Verbose human-readable (parsed) |
 | Client complexity | Low | Medium (SSE parser needed) |
+
+---
+
+## Smart Crawl Orchestrator API
+
+The Orchestrator provides a higher-level crawl API built on top of [`SmartCrawlOrchestrator`](D:\React\seo-utilities-api\src\core\SmartCrawlOrchestrator.ts). Unlike the raw muffet endpoints, the orchestrator:
+
+- Supports **client-disconnect cancellation** via `AbortController` — if the client closes the connection, the crawl is aborted immediately.
+- Sends **named SSE events** (`event: progress`, `event: complete`, `event: error`) for cleaner client-side parsing.
+- Includes a **cache stats** endpoint for monitoring the internal [`ProtectionCache`](D:\React\seo-utilities-api\src\core\ProtectionCache.ts).
+
+All orchestrator endpoints are mounted at `/api/orchestrator` and share the same auth (`x-api-key`), rate limiting, and load tracking as the muffet endpoints.
+
+### POST `/api/orchestrator/crawl`
+
+Trigger a smart crawl and wait for the complete JSON result. The orchestrator uses `AbortController` internally so the crawl can be cancelled, but the POST endpoint waits for the full result before responding.
+
+#### Request Body
+
+```json
+{
+  "url": "https://example.com"
+}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `url` | `string` | ✅ Yes | — | Website URL to crawl (must start with `http://` or `https://`) |
+
+#### Response `200 OK`
+
+```json
+{
+  "success": true,
+  "results": [...],
+  "totalUrls": 42,
+  "durationMs": 3210
+}
+```
+
+> The exact response shape depends on the [`SmartCrawlOrchestrator`](D:\React\seo-utilities-api\src\core\SmartCrawlOrchestrator.ts) implementation. See the source for the full `OrchestratorResult` type.
+
+#### Error Response `4xx/5xx`
+
+```json
+{
+  "success": false,
+  "error": "Orchestrator error: Description of what went wrong"
+}
+```
+
+#### cURL Example
+
+```bash
+curl -X POST http://localhost:3000/api/orchestrator/crawl \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: your-secret-key" \
+  -d '{"url": "https://example.com"}'
+```
+
+#### Source
+
+[`src/routes/orchestrator.routes.ts:24`](D:\React\seo-utilities-api\src\routes\orchestrator.routes.ts:24)
+
+---
+
+### GET `/api/orchestrator/stream`
+
+Receive orchestrator crawl progress in real-time via **Server-Sent Events (SSE)** with named events. Unlike the muffet SSE endpoint, this uses `event:` fields for cleaner client-side event handling.
+
+#### Query Parameters
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `url` | `string` | ✅ Yes | — | Website URL to crawl (must be URL-encoded) |
+
+#### SSE Event Format
+
+Each event uses named SSE event fields:
+
+```
+:ok
+
+event: progress
+data: {"url":"https://example.com/page1","urlsChecked":5,"elapsedMs":1230}
+
+event: complete
+data: {"success":true,"results":[...],"totalUrls":42,"durationMs":3210}
+
+event: error
+data: {"success":false,"error":"Description of what went wrong"}
+```
+
+#### Event Types
+
+| Event | Description | Payload Fields |
+|-------|-------------|----------------|
+| **`:ok`** (comment) | Connection confirmed | No data — comment line sent immediately on connect |
+| **`progress`** | Crawl progress update | `url` (current URL), `urlsChecked` (count), `elapsedMs` |
+| **`complete`** | Crawl finished successfully | `success`, `results[]`, `totalUrls`, `durationMs` |
+| **`error`** | A fatal error occurred | `success`, `error` (message) |
+
+#### Client Disconnect Handling
+
+When the client disconnects (closes the connection), the server:
+1. Calls `abortController.abort()` to cancel the crawl immediately.
+2. Cleans up the active controller from the internal `Map`.
+
+This prevents orphaned crawl processes from consuming resources.
+
+#### cURL Example
+
+```bash
+curl -N -H "x-api-key: your-secret-key" \
+  "http://localhost:3000/api/orchestrator/stream?url=https://example.com"
+```
+
+#### Source
+
+[`src/routes/orchestrator.routes.ts:82`](D:\React\seo-utilities-api\src\routes\orchestrator.routes.ts:82)
+
+---
+
+### GET `/api/orchestrator/stats`
+
+Retrieve cache statistics from the internal [`ProtectionCache`](D:\React\seo-utilities-api\src\core\ProtectionCache.ts). Useful for monitoring cache hit rates and memory usage.
+
+#### Response `200 OK`
+
+```json
+{
+  "success": true,
+  "cache": {
+    "size": 150,
+    "hits": 1200,
+    "misses": 300,
+    "hitRate": 0.8
+  }
+}
+```
+
+> The exact cache stats shape depends on the [`ProtectionCache.getStats()`](D:\React\seo-utilities-api\src\core\ProtectionCache.ts) implementation.
+
+#### cURL Example
+
+```bash
+curl -H "x-api-key: your-secret-key" \
+  "http://localhost:3000/api/orchestrator/stats"
+```
+
+#### Source
+
+[`src/routes/orchestrator.routes.ts:170`](D:\React\seo-utilities-api\src\routes\orchestrator.routes.ts:170)
 
 ---
 
@@ -519,7 +686,7 @@ Catches all unhandled errors and returns a consistent JSON shape:
 | **400** | Bad Request | Missing/invalid fields, invalid URL format, invalid model name |
 | **401** | Unauthorized | Missing `x-api-key` header |
 | **403** | Forbidden | Invalid API key |
-| **429** | Too Many Requests | Rate limit exceeded (Muffet endpoints only) |
+| **429** | Too Many Requests | Rate limit exceeded (Muffet & Orchestrator endpoints only) |
 | **500** | Internal Server Error | Process crashes, parsing failures, unexpected errors |
 | **501** | Not Implemented | Claude/Gemini provider (stub) |
 | **503** | Service Unavailable | `CRAWLER_API_KEY` not configured |
@@ -529,7 +696,7 @@ Catches all unhandled errors and returns a consistent JSON shape:
 | Class | Source | Used For |
 |-------|--------|----------|
 | [`ProviderError`](D:\React\seo-utilities-api\src\services\aiProvider.ts:56) | `aiProvider.ts` | AI provider failures (invalid keys, unsupported models) |
-| [`MuffetError`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:247) | `MuffetCrawler.ts` | Muffet process errors (timeout, injection, parse failure) |
+| [`MuffetError`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:256) | `MuffetCrawler.ts` | Muffet process errors (timeout, injection, parse failure) |
 
 ---
 
@@ -543,14 +710,18 @@ Catches all unhandled errors and returns a consistent JSON shape:
 app.use(cors(corsOptions))
 app.use(express.json({ limit: '1mb' }))
 
-GET  /api/health          → health check (no auth)
+GET  /api/health              → health check (no auth)
 
-POST /api/muffet/crawl    → apiKeyAuth → trackActiveRequests → crawlLimiter → muffetRouter
-GET  /api/muffet/stream   → apiKeyAuth → trackActiveRequests → crawlLimiter → muffetRouter
+POST /api/muffet/crawl        → apiKeyAuth → trackActiveRequests → crawlLimiter → muffetRouter
+GET  /api/muffet/stream       → apiKeyAuth → trackActiveRequests → crawlLimiter → muffetRouter
 
-POST /api/citation/check  → apiKeyAuth → citationRouter
+POST /api/orchestrator/crawl  → apiKeyAuth → trackActiveRequests → crawlLimiter → orchestratorRouter
+GET  /api/orchestrator/stream → apiKeyAuth → trackActiveRequests → crawlLimiter → orchestratorRouter
+GET  /api/orchestrator/stats  → apiKeyAuth → trackActiveRequests → crawlLimiter → orchestratorRouter
 
-app.use(errorHandler)     ← global error handler (last)
+POST /api/citation/check      → apiKeyAuth → citationRouter
+
+app.use(errorHandler)         ← global error handler (last)
 ```
 
 ### Middleware Chain
@@ -560,8 +731,8 @@ app.use(errorHandler)     ← global error handler (last)
 | `cors()` | Express | CORS with configurable origins from `ALLOWED_ORIGINS` env var |
 | `express.json()` | Express | JSON body parser (1MB limit) |
 | [`apiKeyAuth`](D:\React\seo-utilities-api\src\middleware\auth.ts:12) | `auth.ts` | Validates `x-api-key` header against `CRAWLER_API_KEY` |
-| [`trackActiveRequests`](D:\React\seo-utilities-api\src\server.ts:62) | `server.ts` | Increments/decrements active crawl counter for load-sensing |
-| [`crawlLimiter`](D:\React\seo-utilities-api\src\server.ts:75) | `server.ts` | Adaptive rate limiter (5 or 30 req/hr based on load) |
+| [`trackActiveRequests`](D:\React\seo-utilities-api\src\server.ts:63) | `server.ts` | Increments/decrements active crawl counter for load-sensing |
+| [`crawlLimiter`](D:\React\seo-utilities-api\src\server.ts:76) | `server.ts` | Adaptive rate limiter (5 or 30 req/hr based on load) |
 | [`errorHandler`](D:\React\seo-utilities-api\src\middleware\errorHandler.ts:9) | `errorHandler.ts` | Global catch-all error → JSON response |
 
 ### Concurrency Control (Muffet)
@@ -586,19 +757,132 @@ The `MuffetCrawler` class handles **two JSON formats** from muffet v2.x:
 [{"url":"https://...", "links":[{"url":"https://...", "error":"..."}]}, ...]
 ```
 
-[`parseMuffetOutput()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:496) detects and handles both formats transparently, with a JSON-Lines fallback.
+[`parseMuffetOutput()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:509) detects and handles both formats transparently, with a JSON-Lines fallback.
 
 ### Asset Exclusion System
 
 A **two-layer** approach filters out non-page URLs:
 
 1. **Muffet-level:** Regex passed via `--exclude` flag so muffet skips checking asset URLs entirely.
-2. **Post-processing:** [`filterPageRoutes()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:232) runs on parsed results as a safety net, removing:
+2. **Post-processing:** [`filterPageRoutes()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:241) runs on parsed results as a safety net, removing:
    - Static assets: CSS, JS, images, fonts, data files, sourcemaps
    - WordPress paths: `wp-json`, `wp-content`, `wp-includes`, `wp-admin`
    - WordPress system files: `xmlrpc.php`
    - Feed URLs: `/feed`, `/comments/feed`
-   - Duplicate URLs with different fragments (deduplication via [`deduplicateResults()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:214))
+   - Duplicate URLs with different fragments (deduplication via [`deduplicateResults()`](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:223))
+
+---
+
+## External Binary: muffet
+
+The project depends on the [`muffet`](https://github.com/raviqqe/muffet) Go binary (v2.11.5) for link-checking. Because this is a compiled Go binary (not an npm package), it must be downloaded and installed separately.
+
+### Binary Installation
+
+The binary is installed at **build time** by the [`install-muffet.mjs`](D:\React\seo-utilities-api\install-muffet.mjs) script. Here's how it works:
+
+1. **Download** — Uses `fetch()` (native Node.js) to download `muffet_linux_amd64.tar.gz` from the GitHub release. `fetch()` natively follows HTTP redirects (unlike `https.get()`), which is critical because GitHub release URLs redirect multiple times to CloudFront CDN.
+
+2. **Checksum Verification** — Computes SHA256 of the downloaded archive and compares it against both:
+   - A hardcoded expected hash: `64d4db266f308ea7136fe8060a5061bc8a4eea3be5e36350f94a4fcea45309d2`
+   - The remote `checksums.txt` from the GitHub release (as a secondary source of truth)
+   
+   If the checksums don't match, the installation fails with a clear error message.
+
+3. **Extraction** — Uses Node.js `zlib.createGunzip()` + the `tar` npm package to extract the archive. Streams are piped through [`pipeline()`](https://nodejs.org/api/stream.html#streampipeline) from `stream/promises` for proper backpressure handling.
+
+4. **Install** — Copies the binary to **`./bin/muffet`** (project-local, not `/usr/local/bin/`). This path is writable by non-root users, which is essential on StackHost's sandboxed build containers where `/usr/local/bin/` is write-protected.
+
+5. **Verify** — Runs `muffet --version` to confirm the binary executes correctly and reports the expected version.
+
+6. **Cleanup** — Removes temporary files (downloaded tarball, extracted directory).
+
+#### Why project-local `./bin/muffet`?
+
+StackHost's sandboxed build environment runs as a **non-root user** and write-protects `/usr/local/bin/`. Installing to a project-local `bin/` directory:
+
+- ✅ Works on StackHost (and any CI/CD environment)
+- ✅ Avoids permission issues (`EACCES`)
+- ✅ Keeps the binary scoped to the project (no global `$PATH` pollution)
+- ✅ The `bin/` directory is listed in [`.gitignore`](D:\React\seo-utilities-api\.gitignore:3) so it's not committed to the repository
+
+### Build Chain
+
+The full build chain is defined in [`package.json`](D:\React\seo-utilities-api\package.json:8) and [`stackhost.yaml`](D:\React\seo-utilities-api\stackhost.yaml:6):
+
+```
+npm install                  → Install npm dependencies (tar, typescript, express, etc.)
+npm run install:muffet       → Run install-muffet.mjs (download + verify + install ./bin/muffet)
+npm run build                → tsc -p tsconfig.json (compile TypeScript → dist/)
+npm run start                → node dist/server.js
+```
+
+### Flag Syntax
+
+Muffet is a **Go binary** and expects Unix-style flags with `-` (short) or `--` (long) prefix. The codebase previously used Windows-style `/` prefixes (e.g., `/c 10`, `/json`) which caused muffet to fail with "invalid number of arguments".
+
+The current flag syntax is correct:
+
+| Purpose | Short Flag | Long Flag |
+|---------|-----------|-----------|
+| Concurrency | `-c 10` | — |
+| JSON output | `-f json` | — |
+| Verbose output | — | `--verbose` |
+| Page timeout | — | `--timeout 60` |
+| Include pattern | — | `--include regex` |
+| Exclude pattern | — | `--exclude regex` |
+
+These flags are built in two places:
+
+- [`crawl()` method](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:314) — for JSON output (`POST /api/muffet/crawl`): `-c`, `-f json`, `--timeout`, `--include`, `--exclude`
+- [`buildArgs()` static method](D:\React\seo-utilities-api\src\core\MuffetCrawler.ts:445) — for verbose output (`GET /api/muffet/stream`): `-c`, `--verbose`, `--timeout`, `--include`, `--exclude`
+
+Both methods log the exact command via `console.log('[MUFFET]', binaryPath, JSON.stringify(args))` for debugging.
+
+---
+
+## StackHost Deployment
+
+The project is configured for deployment on **StackHost's free tier** via [`stackhost.yaml`](D:\React\seo-utilities-api\stackhost.yaml).
+
+### Configuration
+
+```yaml
+runtime:
+  image: node:22
+
+commands:
+  package: ""
+  build:
+    - "npm install"
+    - "npm run install:muffet"
+    - "npm run build"
+  start: "npm run start"
+
+repository:
+  branch: main
+  auto_deploy: true
+```
+
+### Key Constraints
+
+StackHost's free-tier sandbox has two important constraints that shaped this project's architecture:
+
+| Constraint | Mitigation |
+|-----------|------------|
+| 🚫 **Disallowed system commands** (`tar`, `curl`, `chmod`, `mv`) | [`install-muffet.mjs`](D:\React\seo-utilities-api\install-muffet.mjs) uses only Node.js built-in modules (`fetch`, `zlib`, `crypto`, `fs`) plus the `tar` npm package. No shell commands needed. |
+| 🚫 **`/usr/local/bin/` write-protected** (non-root user) | Binary installed to project-local `./bin/muffet` which is writable by any user. |
+
+### Required Environment Variables
+
+Set these in the StackHost dashboard or `.env` file:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CRAWLER_API_KEY` | ✅ Yes | API key for `x-api-key` authentication |
+| `OPENAI_API_KEY` | ✅ Yes* | OpenAI API key (for citation check) |
+
+> *Required only if using the citation-check endpoint with the OpenAI provider.
 
 ---
 
@@ -664,6 +948,16 @@ interface ScoreResult {
 }
 ```
 
+### Orchestrator Types ([`src/core/SmartCrawlOrchestrator.ts`](D:\React\seo-utilities-api\src\core\SmartCrawlOrchestrator.ts))
+
+```typescript
+interface OrchestratorProgress {
+  url: string;
+  urlsChecked: number;
+  elapsedMs: number;
+}
+```
+
 ---
 
 ## Environment Variables
@@ -688,22 +982,29 @@ interface ScoreResult {
 D:\React\seo-utilities-api\
 ├── .env                        # Environment variables (gitignored)
 ├── .env.example                # Environment variable template
-├── .gitignore
+├── .gitignore                  # Ignores node_modules/, dist/, bin/, .env
+├── stackhost.yaml              # StackHost deployment configuration
+├── install-muffet.mjs          # Node.js script: download + verify + install muffet binary
 ├── Dockerfile                  # Multi-stage: Go (muffet) + Node.js
-├── package.json                # Dependencies & scripts
+├── package.json                # Dependencies & scripts (ESM)
 ├── tsconfig.json               # TypeScript configuration
 ├── README.md                   # Quick-start README
 ├── API_DOCUMENTATION.md        # ← This file
-├── dist/                       # Compiled JS output
+├── bin/                        # Project-local muffet binary (gitignored — built at deploy time)
+│   └── muffet                  # Downloaded Go binary (v2.11.5 linux_amd64)
+├── dist/                       # Compiled JS output (gitignored)
 └── src/
     ├── server.ts               # Express app setup, middleware, routing
     ├── core/
-    │   └── MuffetCrawler.ts    # Muffet process wrapper + output parser
+    │   ├── MuffetCrawler.ts    # Muffet process wrapper + output parser
+    │   ├── SmartCrawlOrchestrator.ts  # High-level crawl orchestrator with AbortController
+    │   └── ProtectionCache.ts  # Cache for protection data
     ├── middleware/
     │   ├── auth.ts             # API key authentication
     │   └── errorHandler.ts     # Global error handler
     ├── routes/
     │   ├── muffet.routes.ts    # POST /crawl, GET /stream
+    │   ├── orchestrator.routes.ts  # POST /crawl, GET /stream (SSE), GET /stats
     │   └── citation.routes.ts  # POST /check
     ├── services/
     │   ├── aiProvider.ts       # Abstract AI provider + factory
