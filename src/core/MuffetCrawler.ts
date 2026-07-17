@@ -288,10 +288,11 @@ export class MuffetCrawler {
 
       // 3. Build arguments — no shell, just an argv array
       //    IMPORTANT: Flags MUST use Unix-style --dash prefix (not /slash).
-      //    Muffet is a Go binary running on Linux — it expects -c, -f, --timeout, etc.
+      //    Muffet is a Go binary running on Linux — it expects -c, --format, --timeout, etc.
+      //    NOTE: -f is --ignore-fragments (boolean), NOT format. Use --format for JSON output.
       const args: string[] = [];
 
-      args.push('-c', String(concurrency), '-f', 'json', '--timeout', String(pageTimeout));
+      args.push('-c', String(concurrency), '--format', 'json', '--timeout', String(pageTimeout));
       if (excludePattern) args.push('--exclude', excludePattern);
       args.push(url);
 
