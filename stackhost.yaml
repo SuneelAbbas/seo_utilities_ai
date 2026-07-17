@@ -1,0 +1,10 @@
+name: muffet-api-service
+runtime: node
+build:
+  command: npm install && npm run build
+start:
+  command: node dist/server.js
+port: 3000
+env:
+  - CRAWLER_API_KEY
+  - ALLOWED_ORIGINS
