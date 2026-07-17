@@ -1,11 +1,24 @@
 runtime:
   image: node:22
 
+# Playwright needs to find Chromium browser binaries.
+# Setting PLAYWRIGHT_BROWSERS_PATH=0 installs browsers inside node_modules/
+# (project-local), which avoids permission issues on StackHost where the
+# non-root user cannot write to ~/.cache/ms-playwright.
+env:
+  - name: PLAYWRIGHT_BROWSERS_PATH
+    value: "0"
+
 commands:
   package: ""
   build:
     - "npm install"
     - "npm run install:muffet"
+    # Install Chromium for Playwright-based DeepCrawlEngine (used by
+    # /api/orchestrator/crawl attempts 2 & 3).
+    # IMPORTANT: Do NOT add --with-deps flag — it runs apt-get internally
+    # which is disallowed in StackHost's sandboxed build environment.
+    - "npx playwright install chromium"
     - "npm run build"
   start: "npm run start"
 
