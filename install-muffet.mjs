@@ -1,25 +1,28 @@
 /**
  * install-muffet.mjs
  *
- * Downloads the muffet link-checker binary and installs it to /usr/local/bin.
+ * Downloads the muffet link-checker binary and installs it into the project's
+ * `bin/` directory (instead of /usr/local/bin/) because StackHost's sandboxed
+ * build-container has /usr/local/bin/ write-protected for non-root users.
+ *
  * Uses only Node.js built-in modules (fetch, zlib, crypto, fs) plus the `tar`
  * npm package to avoid system commands (curl, tar, chmod, mv) that StackHost
  * disallows.
  *
- * v2 — Fixed download-corruption bug:
- *   - Replaced https.get() with fetch() (native redirect following)
- *   - Replaced .pipe() with stream/promises pipeline() (proper backpressure)
- *   - Added download-size verification
- *   - Added optional SHA256 checksum verification
+ * v3 — Install path changed to project-local ./bin/muffet:
+ *   - Target is now process.cwd() + '/bin/muffet' (writable by non-root user)
+ *   - Creates bin/ directory automatically if missing
+ *   - Sets executable permission (0o755) after copy
  */
 
 import { createGunzip } from "zlib";
 import { pipeline } from "stream/promises";
-import { createWriteStream, promises as fs, statSync } from "fs";
+import { createWriteStream, promises as fs, statSync, existsSync, mkdirSync } from "fs";
 import { createHash } from "crypto";
 import * as tar from "tar";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 
 // ─── Configuration ─────────────────────────────────────────────────────────
 
@@ -32,7 +35,10 @@ const CHECKSUMS_URL = `${RELEASE_BASE}/muffet_${MUFFET_VERSION.replace("v", "")}
 const TMP_TAR = join(tmpdir(), "muffet.tar.gz");
 const TMP_EXTRACT = join(tmpdir(), "muffet-extract");
 const BINARY_NAME = "muffet";
-const INSTALL_PATH = "/usr/local/bin/muffet";
+
+// Install to project-local bin/ directory — writable by non-root user
+const PROJECT_BIN = join(process.cwd(), "bin");
+const INSTALL_PATH = join(PROJECT_BIN, "muffet");
 
 // Expected SHA256 for muffet v2.11.5 linux_amd64
 const EXPECTED_SHA256 = "64d4db266f308ea7136fe8060a5061bc8a4eea3be5e36350f94a4fcea45309d2";
@@ -148,11 +154,19 @@ async function installBinary(extractDir, binaryName, installPath) {
     );
   }
 
+  // Ensure the target bin/ directory exists (create recursively if needed)
+  const binDir = dirname(installPath);
+  if (!existsSync(binDir)) {
+    mkdirSync(binDir, { recursive: true });
+    console.log(`   Created directory: ${binDir}`);
+  }
+
   await fs.copyFile(source, installPath);
   await fs.chmod(installPath, 0o755);
 
   const stats = statSync(installPath);
   console.log(`   Installed size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+  console.log(`   Permissions: ${stats.mode.toString(8)}`);
   console.log("   ✅ Installation complete");
 }
 

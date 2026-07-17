@@ -1,4 +1,13 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { join } from 'node:path';
+
+/**
+ * Absolute path to the project-local muffet binary.
+ * Installed at build-time by npm run install:muffet into ./bin/muffet.
+ * Using a full path avoids reliance on $PATH, which is important on StackHost
+ * where /usr/local/bin/ is write-protected for non-root users.
+ */
+const MUFFET_BINARY_PATH = join(process.cwd(), 'bin', 'muffet');
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -308,16 +317,17 @@ export class MuffetCrawler {
       // ── DEBUG: log exact muffet command before execution ─────────
       console.log('');
       console.log('══════════════════════════════════════════════════════');
-      console.log('[MUFFET] Executing: muffet ' + args.join(' '));
+      console.log('[MUFFET] Executing:', MUFFET_BINARY_PATH, args.join(' '));
       console.log('[MUFFET] includePattern:', includePattern ?? '(none)');
       console.log('[MUFFET] excludePattern:', excludePattern ?? '(none)');
       console.log('══════════════════════════════════════════════════════');
       console.log('');
 
       // 3. Execute muffet via execFile (safe — no shell)
+      //    Uses MUFFET_BINARY_PATH (project-local ./bin/muffet) instead of relying on $PATH
       const { stdout, stderr } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
         const child = execFile(
-          'muffet',
+          MUFFET_BINARY_PATH,
           args,
           {
             timeout: processTimeoutMs,
@@ -329,7 +339,7 @@ export class MuffetCrawler {
               console.error('');
               console.error('══════════════════════════════════════════════════════');
               console.error('[MUFFET-ERROR] muffet process exited with error');
-              console.error('[MUFFET-ERROR] EXACT COMMAND: muffet ' + args.join(' '));
+              console.error('[MUFFET-ERROR] EXACT COMMAND:', MUFFET_BINARY_PATH, args.join(' '));
               console.error('[MUFFET-ERROR] ERROR OBJECT:', err);
               console.error('[MUFFET-ERROR] STDERR:', stderr);
               console.error('[MUFFET-ERROR] STDOUT (first 500 chars):', stdout?.slice(0, 500));
@@ -435,7 +445,7 @@ export class MuffetCrawler {
     args.push(url);
 
     // ── DEBUG: log the built args ─────────────────────────────────
-    console.log('[MUFFET-buildArgs] muffet ' + args.join(' '));
+    console.log('[MUFFET-buildArgs]', MUFFET_BINARY_PATH, args.join(' '));
     return args;
   }
 
@@ -456,10 +466,10 @@ export class MuffetCrawler {
   ): ChildProcess {
     const args = MuffetCrawler.buildArgs(url, concurrency, pageTimeout, includePattern, excludePattern);
     // ── DEBUG: log the spawned command ─────────────────────────────
-    console.log('[MUFFET-spawnStream] Spawning: muffet ' + args.join(' '));
+    console.log('[MUFFET-spawnStream] Spawning:', MUFFET_BINARY_PATH, args.join(' '));
     console.log('[MUFFET-spawnStream] includePattern:', includePattern ?? '(none)');
     console.log('[MUFFET-spawnStream] excludePattern:', excludePattern ?? '(none)');
-    const child = spawn('muffet', args, {
+    const child = spawn(MUFFET_BINARY_PATH, args, {
       timeout: processTimeoutMs,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -470,7 +480,7 @@ export class MuffetCrawler {
       console.error('');
       console.error('══════════════════════════════════════════════════════');
       console.error('[MUFFET-spawnStream-ERROR] Child process error');
-      console.error('[MUFFET-spawnStream-ERROR] EXACT COMMAND: muffet ' + args.join(' '));
+      console.error('[MUFFET-spawnStream-ERROR] EXACT COMMAND:', MUFFET_BINARY_PATH, args.join(' '));
       console.error('[MUFFET-spawnStream-ERROR] ERROR:', err.message);
       console.error('[MUFFET-spawnStream-ERROR] STACK:', err.stack);
       console.error('══════════════════════════════════════════════════════');
