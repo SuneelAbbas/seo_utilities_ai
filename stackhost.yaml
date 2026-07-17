@@ -4,9 +4,10 @@ runtime:
 commands:
   package: ""
   build:
-    - "apt-get update && apt-get install -y golang-go"
-    - "go install github.com/raviqqe/muffet/v2@latest"
-    - "export PATH=$PATH:/root/go/bin"
+    - "curl -L -o muffet.tar.gz https://github.com/raviqqe/muffet/releases/latest/download/muffet_linux_amd64.tar.gz"
+    - "tar -xzf muffet.tar.gz"
+    - "chmod +x muffet"
+    - "mv muffet /usr/local/bin/muffet"
     - "npm install"
     - "npm run build"
   start: "npm run start"
