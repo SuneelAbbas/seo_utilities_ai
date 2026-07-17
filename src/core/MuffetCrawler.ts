@@ -307,17 +307,19 @@ export class MuffetCrawler {
         : undefined;
 
       // 3. Build arguments — no shell, just an argv array
+      //    IMPORTANT: Flags MUST use Unix-style --dash prefix (not /slash).
+      //    Muffet is a Go binary running on Linux — it expects -c, -f, --timeout, etc.
       const args: string[] = [];
 
-      args.push('/c', String(concurrency), '/json', '/timeout', String(pageTimeout));
-      if (includePattern) args.push('/include', includePattern);
-      if (excludePattern) args.push('/exclude', excludePattern);
+      args.push('-c', String(concurrency), '-f', 'json', '--timeout', String(pageTimeout));
+      if (includePattern) args.push('--include', includePattern);
+      if (excludePattern) args.push('--exclude', excludePattern);
       args.push(url);
 
       // ── DEBUG: log exact muffet command before execution ─────────
       console.log('');
       console.log('══════════════════════════════════════════════════════');
-      console.log('[MUFFET] Executing:', MUFFET_BINARY_PATH, args.join(' '));
+      console.log('[MUFFET] Executing:', MUFFET_BINARY_PATH, JSON.stringify(args));
       console.log('[MUFFET] includePattern:', includePattern ?? '(none)');
       console.log('[MUFFET] excludePattern:', excludePattern ?? '(none)');
       console.log('══════════════════════════════════════════════════════');
@@ -439,13 +441,14 @@ export class MuffetCrawler {
   ): string[] {
     const args: string[] = [];
 
-    args.push('/c', String(concurrency), '/verbose', '/timeout', String(pageTimeout));
-    if (includePattern) args.push('/include', includePattern);
-    if (excludePattern) args.push('/exclude', excludePattern);
+    // Unix-style flags for Linux muffet binary
+    args.push('-c', String(concurrency), '--verbose', '--timeout', String(pageTimeout));
+    if (includePattern) args.push('--include', includePattern);
+    if (excludePattern) args.push('--exclude', excludePattern);
     args.push(url);
 
     // ── DEBUG: log the built args ─────────────────────────────────
-    console.log('[MUFFET-buildArgs]', MUFFET_BINARY_PATH, args.join(' '));
+    console.log('[MUFFET-buildArgs]', MUFFET_BINARY_PATH, JSON.stringify(args));
     return args;
   }
 
