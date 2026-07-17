@@ -1,10 +1,16 @@
-name: muffet-api-service
-runtime: node
-build:
-  command: npm install && npm run build
-start:
-  command: node dist/server.js
-port: 3000
-env:
-  - CRAWLER_API_KEY
-  - ALLOWED_ORIGINS
+runtime:
+  image: node:22
+
+commands:
+  package: ""
+  build:
+    - "apt-get update && apt-get install -y golang-go"
+    - "go install github.com/raviqqe/muffet/v2@latest"
+    - "export PATH=$PATH:/root/go/bin"
+    - "npm install"
+    - "npm run build"
+  start: "npm run start"
+
+repository:
+  branch: main
+  auto_deploy: true
