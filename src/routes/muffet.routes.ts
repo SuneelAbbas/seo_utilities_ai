@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import {
   type MuffetResult,
   MuffetCrawler,
-  buildCombinedExcludePattern,
+  buildAssetExcludePattern,
   filterPageRoutes,
 } from '../core/MuffetCrawler.js';
 
@@ -150,24 +150,25 @@ router.get('/stream', async (req: Request, res: Response) => {
       timestamp: startTime,
     });
 
-    // ── Build combined exclude pattern ───────────────────────────
+    // ── Build asset/wp exclude pattern ───────────────────────────
     //     muffet has NO --include flag — only -e/--exclude.
-    //     The hostname restriction is baked into the exclude pattern
-    //     via negative lookahead.
+    //     Hostname restriction is NOT done via regex (Go's RE2 engine
+    //     doesn't support negative lookaheads). Instead, external URLs
+    //     are filtered out in post-processing below.
     const hostname = new URL(url).hostname;
-    const combinedExcludePattern = buildCombinedExcludePattern(hostname, excludeAssets);
+    const excludePattern = excludeAssets ? buildAssetExcludePattern() : undefined;
 
     // ── DEBUG: log pattern before spawning ───────────────────────
     console.log('');
     console.log('══════════════════════════════════════════════════════');
     console.log('[MUFFET-SSE] URL:', url);
     console.log('[MUFFET-SSE] excludeAssets:', excludeAssets);
-    console.log('[MUFFET-SSE] combinedExcludePattern:', combinedExcludePattern ?? '(none — no --exclude flag)');
+    console.log('[MUFFET-SSE] excludePattern:', excludePattern ?? '(none — no --exclude flag)');
     console.log('══════════════════════════════════════════════════════');
     console.log('');
 
     // ── Spawn muffet process ─────────────────────────────────────
-    const child = MuffetCrawler.spawnStream(url, undefined, undefined, undefined, combinedExcludePattern);
+    const child = MuffetCrawler.spawnStream(url, undefined, undefined, undefined, excludePattern);
     const stdoutLines: string[] = [];
     let urlsChecked = 0;
     let currentUrl = '';

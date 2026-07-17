@@ -112,40 +112,29 @@ function escapeRegex(str: string): string {
 }
 
 /**
- * Build a COMBINED exclude regex pattern for muffet's --exclude flag.
+ * Build the muffet --exclude regex pattern that excludes:
+ *   1. Static asset file extensions (CSS, JS, fonts, images, data files, sourcemaps)
+ *   2. WordPress system paths (wp-json, wp-content, wp-includes, wp-admin)
+ *   3. WordPress system files (xmlrpc.php)
+ *   4. Static asset directories (_static)
+ *   5. Feed / comment-feed URLs
  *
- * Muffet does NOT have an --include flag — only -e/--exclude.
- * To restrict crawling to a single hostname AND exclude assets, we
- * merge both concerns into ONE --exclude pattern using alternation.
+ * Uses ONLY RE2-compatible syntax (no lookahead/lookbehind) since muffet
+ * uses Go's standard regexp package which implements RE2.
  *
- * The hostname restriction uses a negative lookahead to exclude any
- * URL that does NOT start with the target hostname:
- *   ^(?!https?://(www\.)?hostname)
+ * Combined with alternation (`|`) so any one match excludes the URL.
  *
- * If excludeAssets is true, asset/wp patterns are appended via |.
+ * NOTE: Hostname restriction is NOT done via --exclude because RE2
+ * doesn't support negative lookaheads. Instead, hostname filtering is
+ * done in post-processing (see filterPageRoutes and internal-only check
+ * in crawl() / SSE handler).
  *
- * Returns undefined if no filtering is needed (both internalOnly=false
- * and excludeAssets=false).
+ * Returns undefined if excludeAssets is false.
  */
-export function buildCombinedExcludePattern(
-  hostname: string,
-  excludeAssets: boolean,
-): string | undefined {
-  const stripped = hostname.replace(/^www\./i, '');
-  const escaped = escapeRegex(stripped);
-
-  // Negative lookahead: exclude URLs NOT on the target hostname.
-  // This effectively acts as an "include only this hostname" rule.
-  const hostnameRestriction = `^(?!https?://(www\\.)?${escaped})`;
-
-  if (!excludeAssets) {
-    return hostnameRestriction;
-  }
-
+export function buildAssetExcludePattern(): string | undefined {
   const assetExt = '\\.(css|js|mjs|woff2?|ttf|eot|svg|png|jpe?g|gif|webp|ico|json|xml|map)(\\?.*)?$';
   const wpPaths = '/wp-json/|/wp-content/|/wp-includes/|/wp-admin/|/xmlrpc\\.php|/_static/|/feed/?$|/comments/feed/?$';
-
-  return `(${hostnameRestriction})|(${assetExt})|(${wpPaths})`;
+  return `${assetExt}|${wpPaths}`;
 }
 
 /**
@@ -287,18 +276,19 @@ export class MuffetCrawler {
       // 1. Sanitize the URL
       const url = sanitizeUrl(options.url);
 
-      // 2. Extract hostname for combined exclude pattern
+      // 2. Extract hostname for post-processing filtering
       const hostname = new URL(url).hostname;
 
-      // 2a. Build combined exclude pattern — muffet has NO --include flag,
-      //     only -e/--exclude. The hostname restriction is baked into the
-      //     exclude pattern via negative lookahead.
-      const excludePattern = buildCombinedExcludePattern(hostname, excludeAssets);
+      // 2a. Build asset/wp exclude pattern for --exclude flag.
+      //     NOTE: muffet has NO --include flag — only -e/--exclude.
+      //     Hostname restriction is NOT done via regex because Go's RE2
+      //     engine doesn't support negative lookaheads. Instead, we
+      //     filter external URLs in post-processing below.
+      const excludePattern = buildAssetExcludePattern();
 
       // 3. Build arguments — no shell, just an argv array
       //    IMPORTANT: Flags MUST use Unix-style --dash prefix (not /slash).
       //    Muffet is a Go binary running on Linux — it expects -c, -f, --timeout, etc.
-      //    NOTE: muffet has NO --include flag. Only --exclude (-e).
       const args: string[] = [];
 
       args.push('-c', String(concurrency), '-f', 'json', '--timeout', String(pageTimeout));
@@ -363,9 +353,9 @@ export class MuffetCrawler {
       let results = this.parseMuffetOutput(stdout);
 
       // 5. Post-process: apply additional filtering (safety net)
-      //    Even though the --exclude pattern should handle both hostname
-      //    restriction and asset exclusion, this post-processing ensures
-      //    correctness in case the regex has edge cases.
+      //    Since Go's RE2 regex doesn't support negative lookaheads, we
+      //    CANNOT use --exclude for hostname restriction. External URL
+      //    filtering must be done here in post-processing.
       if (results.length > 0) {
         // 5a. Filter out external domains if internalOnly is true
         //     (safety net in case the combined exclude pattern misses some)
@@ -423,10 +413,9 @@ export class MuffetCrawler {
   /**
    * Build the muffet CLI argument array for streaming mode.
    *
-   * muffet has NO --include flag — only -e/--exclude. The include
-   * pattern from the original design was replaced by a combined
-   * exclude pattern that uses negative lookahead for hostname
-   * restriction merged with asset/wp exclusion patterns.
+   * muffet has NO --include flag — only -e/--exclude. Hostname
+   * restriction is done via post-processing (not --exclude regex)
+   * because Go's RE2 engine doesn't support negative lookaheads.
    *
    * If excludePattern is undefined, no --exclude flag is added.
    */
@@ -455,9 +444,11 @@ export class MuffetCrawler {
    * Each line on stdout represents a URL being checked.
    * Process will self-terminate after `processTimeoutMs` if not finished.
    *
-   * @param excludePattern - Combined exclude regex (hostname restriction +
-   *                         asset/wp exclusion). Passed via --exclude. If
-   *                         undefined, no --exclude flag is added.
+   * @param excludePattern - Asset/wp exclude regex passed via --exclude.
+   *                         Hostname restriction is done in post-processing
+   *                         by the SSE handler (not via regex), because
+   *                         Go's RE2 engine doesn't support lookaheads.
+   *                         If undefined, no --exclude flag is added.
    */
   static spawnStream(
     url: string,
