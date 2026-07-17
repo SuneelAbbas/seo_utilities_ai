@@ -1,15 +1,8 @@
 runtime:
-  image: node:22
+  docker:
+    dockerfile: Dockerfile
 
 commands:
-  package: ""
-  build:
-    - "curl -L -o muffet.tar.gz https://github.com/raviqqe/muffet/releases/latest/download/muffet_linux_amd64.tar.gz"
-    - "tar -xzf muffet.tar.gz"
-    - "chmod +x muffet"
-    - "mv muffet /usr/local/bin/muffet"
-    - "npm install"
-    - "npm run build"
   start: "npm run start"
 
 repository:
