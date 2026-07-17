@@ -1,8 +1,12 @@
 runtime:
-  docker:
-    dockerfile: Dockerfile
+  image: node:22
 
 commands:
+  package: ""
+  build:
+    - "npm install"
+    - "npm run install:muffet"
+    - "npm run build"
   start: "npm run start"
 
 repository:

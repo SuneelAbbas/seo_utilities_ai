@@ -8,7 +8,8 @@
     "dev": "tsx watch src/server.ts",
     "start": "node dist/server.js",
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "install:muffet": "node install-muffet.mjs"
   },
   "dependencies": {
     "cors": "^2.8.6",
@@ -22,6 +23,7 @@
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^22.7.5",
+    "tar": "^7.5.20",
     "tsx": "^4.19.1",
     "typescript": "^5.6.3"
   },
