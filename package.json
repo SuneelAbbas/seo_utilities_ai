@@ -6,10 +6,13 @@
   "main": "dist/server.js",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "start": "node dist/server.js",
+    "start": "node --max-old-space-size=384 dist/server.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
-    "install:muffet": "node install-muffet.mjs"
+    "install:muffet": "node install-muffet.mjs",
+    "postinstall": "node install-muffet.mjs && npx playwright install chromium --with-deps 2>/dev/null || echo '⚠️  Playwright install skipped (not a Linux build environment)'",
+    "deploy:build": "npm install && npm run build",
+    "deploy:start": "pm2 start ecosystem.config.cjs --env production || npm start"
   },
   "dependencies": {
     "cors": "^2.8.6",

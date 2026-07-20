@@ -2,5 +2,7 @@ node_modules/
 dist/
 bin/
 .env
+.env.production
+logs/
 *.log
 .DS_Store
