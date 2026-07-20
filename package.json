@@ -1,7 +1,7 @@
 {
   "name": "seo-utilities-api",
   "version": "1.0.0",
-  "description": "Combined SEO utilities API — muffet link-checker + AI citation tracker. Fast website crawling & AI search visibility analysis in one service.",
+  "description": "SEO utilities API — muffet link-checker with queue-based crawling and SSE progress streaming.",
   "type": "module",
   "main": "dist/server.js",
   "scripts": {
@@ -16,7 +16,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^7.5.0",
-    "openai": "^4.73.0",
+    "p-queue": "^9.3.1",
     "playwright": "^1.61.1"
   },
   "devDependencies": {

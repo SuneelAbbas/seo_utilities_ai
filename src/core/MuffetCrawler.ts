@@ -2,12 +2,22 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { join } from 'node:path';
 
 /**
+ * Detect the current platform and return the appropriate binary name.
+ * - Linux/macOS:  muffet
+ * - Windows:      muffet.exe
+ */
+function getMuffetBinaryName(): string {
+  return process.platform === 'win32' ? 'muffet.exe' : 'muffet';
+}
+
+/**
  * Absolute path to the project-local muffet binary.
- * Installed at build-time by npm run install:muffet into ./bin/muffet.
+ * Installed at build-time by npm run install:muffet into ./bin/muffet (or muffet.exe on Windows).
  * Using a full path avoids reliance on $PATH, which is important on StackHost
  * where /usr/local/bin/ is write-protected for non-root users.
  */
-const MUFFET_BINARY_PATH = join(process.cwd(), 'bin', 'muffet');
+const MUFFET_BINARY_NAME = getMuffetBinaryName();
+const MUFFET_BINARY_PATH = join(process.cwd(), 'bin', MUFFET_BINARY_NAME);
 
 // ─── Types ───────────────────────────────────────────────────────────
 

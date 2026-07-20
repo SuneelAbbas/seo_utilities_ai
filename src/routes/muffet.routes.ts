@@ -1,4 +1,7 @@
 import { Router, type Request, type Response } from 'express';
+import PQueue from 'p-queue';
+import { EventEmitter } from 'events';
+import crypto from 'crypto';
 import {
   type MuffetResult,
   MuffetCrawler,
@@ -10,42 +13,128 @@ import {
 
 const router = Router();
 
-// ─── Concurrency semaphore ───────────────────────────────────────────
-// Max 2 concurrent muffet processes
-
-interface QueuedRequest {
-  resolve: () => void;
-  reject: (err: Error) => void;
-}
-
-let activeMuffetProcesses = 0;
-const MAX_CONCURRENT_MUFFET = 2;
-const requestQueue: QueuedRequest[] = [];
+// ═════════════════════════════════════════════════════════════════════
+//  CONFIGURATION (from environment)
+// ═════════════════════════════════════════════════════════════════════
 
 /**
- * Acquire a semaphore slot. If at capacity, queue the request.
+ * Max muffet processes running in parallel (1–50).
+ * env: MUFFET_MAX_CONCURRENCY  (default: 5)
  */
-function acquireMuffetSlot(): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    if (activeMuffetProcesses < MAX_CONCURRENT_MUFFET) {
-      activeMuffetProcesses++;
-      resolve();
-    } else {
-      requestQueue.push({ resolve, reject });
+const MUFFET_QUEUE_CONCURRENCY = Math.max(
+  1,
+  Math.min(50, Number(process.env.MUFFET_MAX_CONCURRENCY) || 5)
+);
+
+/**
+ * Max number of queued (waiting) requests before we return 503.
+ * This is a safety valve for extreme bursts (e.g. 1000 req/s).
+ * env: MUFFET_MAX_QUEUE_SIZE  (default: 200)
+ *
+ * With MUFFET_MAX_CONCURRENCY=5 and each crawl taking ~5s average,
+ * 200 queue slots = ~200s of backlog = ~40 crawls/minute throughput.
+ * On StackHost's 512MB RAM this prevents unbounded memory growth.
+ */
+const MUFFET_MAX_QUEUE_SIZE = Math.max(
+  10,
+  Math.min(1000, Number(process.env.MUFFET_MAX_QUEUE_SIZE) || 200)
+);
+
+// ═════════════════════════════════════════════════════════════════════
+//  PQUEUE — FIFO crawl queue
+// ═════════════════════════════════════════════════════════════════════
+
+const crawlQueue = new PQueue({
+  concurrency: MUFFET_QUEUE_CONCURRENCY,
+  autoStart: true,
+});
+
+// Track currently active (actually processing, not queued) crawls
+let activeProcessing = 0;
+
+function getQueueStats() {
+  return {
+    queueLength: crawlQueue.size,
+    pendingCount: crawlQueue.pending,
+    activeProcessing,
+    maxConcurrency: MUFFET_QUEUE_CONCURRENCY,
+    maxQueueSize: MUFFET_MAX_QUEUE_SIZE,
+  };
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  JOB TRACKER — live SSE queue-position updates
+// ═════════════════════════════════════════════════════════════════════
+
+interface JobInfo {
+  jobId: string;
+  url: string;
+  status: 'queued' | 'processing' | 'completed' | 'failed';
+  position: number;
+  createdAt: number;
+  /** EventEmitter for streaming position updates to SSE clients */
+  emitter: EventEmitter;
+}
+
+/**
+ * In-memory job registry. Each submitted crawl gets a unique jobId and
+ * an EventEmitter. As the queue processes, position updates are emitted
+ * so SSE clients get live queue-position streaming.
+ *
+ * The Map preserves insertion order, which matches PQueue's FIFO order
+ * (since we add jobs in sequence).
+ */
+const jobs = new Map<string, JobInfo>();
+
+/** Clean up completed/failed jobs older than 10 minutes */
+const JOB_TTL_MS = 10 * 60 * 1000;
+
+// Periodically purge stale jobs to prevent memory leaks
+setInterval(() => {
+  const cutoff = Date.now() - JOB_TTL_MS;
+  for (const [id, job] of jobs) {
+    if (
+      (job.status === 'completed' || job.status === 'failed') &&
+      job.createdAt < cutoff
+    ) {
+      job.emitter.removeAllListeners();
+      jobs.delete(id);
     }
-  });
+  }
+}, 60_000);
+
+/**
+ * Calculate the current queue position of a queued job based on
+ * insertion order (all queued jobs before it in the Map).
+ */
+function recalculatePosition(jobId: string): number {
+  let pos = 1;
+  for (const [id, job] of jobs) {
+    if (id === jobId) return pos;
+    if (job.status === 'queued') pos++;
+  }
+  return pos;
 }
 
 /**
- * Release a semaphore slot and wake the next queued request (if any).
+ * Notify all queued jobs of their updated position. Called whenever
+ * a job completes/fails (which moves everyone behind it forward).
  */
-function releaseMuffetSlot(): void {
-  const next = requestQueue.shift();
-  if (next) {
-    // Don't increment — the slot is transferred directly
-    next.resolve();
-  } else {
-    activeMuffetProcesses = Math.max(0, activeMuffetProcesses - 1);
+function broadcastPositionUpdates() {
+  let pos = 1;
+  for (const [, job] of jobs) {
+    if (job.status === 'queued') {
+      const oldPos = job.position;
+      job.position = pos;
+      if (oldPos !== pos) {
+        job.emitter.emit('position', {
+          status: 'queued',
+          position: pos,
+          updatedAt: Date.now(),
+        });
+      }
+      pos++;
+    }
   }
 }
 
@@ -62,13 +151,6 @@ function isValidUrl(str: string): boolean {
 
 // ─── Verbose output parser ───────────────────────────────────────────
 
-/**
- * Parse muffet verbose output lines into MuffetResult-like objects.
- *
- * Verbose format:
- *   https://example.com/          ← URL being checked (no tab prefix)
- *   \t200\thttps://linked.com     ← tab-indented result (status + linked URL)
- */
 function parseVerboseOutput(lines: string[]): MuffetResult[] {
   const results: MuffetResult[] = [];
   for (const line of lines) {
@@ -88,15 +170,125 @@ function parseVerboseOutput(lines: string[]): MuffetResult[] {
   return results;
 }
 
-// ─── GET /api/muffet/stream (SSE — real-time progress) ─────────────
+// ═════════════════════════════════════════════════════════════════════
+//  GET /api/muffet/queue/:jobId  (SSE — live queue-position tracking)
+// ═════════════════════════════════════════════════════════════════════
+//
+// Clients receive real-time SSE events as their queued position changes.
+// Useful when the queue is long — the client can show a live countdown.
+//
+// Events:
+//   - { type: "connected", jobId, status, position, ... }
+//   - { type: "position",  status, position, updatedAt }
+//   - { type: "started",   status: "processing" }
+//   - { type: "completed", status: "completed"|"failed" }
+//   - { type: "error",     message }
+
+router.get('/queue/:jobId', (req: Request, res: Response) => {
+  const jobId = req.params.jobId as string;
+
+  const job = jobs.get(jobId);
+  if (!job) {
+    res.status(404).json({
+      success: false,
+      error: `Job ${jobId} not found. It may have already been purged (jobs kept for 10 min).`,
+    });
+    return;
+  }
+
+  // ── SSE setup ──────────────────────────────────────────────────
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  req.socket.setTimeout(0);
+  req.socket.setNoDelay(true);
+
+  let aborted = false;
+
+  const cleanup = () => {
+    aborted = true;
+    job.emitter.removeListener('position', onPosition);
+    job.emitter.removeListener('started', onStarted);
+    job.emitter.removeListener('completed', onCompleted);
+  };
+
+  req.on('close', cleanup);
+  req.on('error', cleanup);
+
+  const sendSSE = (type: string, data: Record<string, unknown>) => {
+    if (!aborted) {
+      res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+    }
+  };
+
+  // ── Send initial connection event ──────────────────────────────
+  sendSSE('connected', {
+    jobId,
+    status: job.status,
+    position: job.position,
+    url: job.url,
+    queueStats: getQueueStats(),
+    message:
+      job.status === 'queued'
+        ? `You are #${job.position} in the queue. Waiting for ${job.position - 1} request(s) ahead.`
+        : job.status === 'processing'
+          ? 'Your crawl is now processing.'
+          : job.status === 'completed'
+            ? 'Your crawl has completed.'
+            : 'Your crawl has failed.',
+  });
+
+  // ── Attach listeners for live updates ──────────────────────────
+  const onPosition = (data: { status: string; position: number; updatedAt: number }) => {
+    sendSSE('position', data);
+  };
+
+  const onStarted = () => {
+    sendSSE('started', { status: 'processing', position: 0 });
+  };
+
+  const onCompleted = (data: { status: string }) => {
+    sendSSE('completed', data);
+    // After sending the final event, close the connection
+    setTimeout(() => {
+      if (!aborted) {
+        res.end();
+        cleanup();
+      }
+    }, 100);
+  };
+
+  job.emitter.on('position', onPosition);
+  job.emitter.on('started', onStarted);
+  job.emitter.on('completed', onCompleted);
+
+  // If job is already completed/failed by the time the client subscribes,
+  // send the terminal event immediately
+  if (job.status === 'completed') {
+    sendSSE('completed', { status: 'completed' });
+    setTimeout(() => { if (!aborted) { res.end(); cleanup(); } }, 100);
+  } else if (job.status === 'failed') {
+    sendSSE('completed', { status: 'failed' });
+    setTimeout(() => { if (!aborted) { res.end(); cleanup(); } }, 100);
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════
+//  GET /api/muffet/stream (SSE — real-time crawl progress via spawn)
+// ═════════════════════════════════════════════════════════════════════
+// Note: This is the old SSE endpoint for live muffet output. It spawns
+// muffet directly (bypasses queue) for real-time streaming use cases.
 
 router.get('/stream', async (req: Request, res: Response) => {
   try {
     const url = req.query.url as string | undefined;
-    const internalOnly = req.query.internalOnly !== 'false'; // default true
-    const excludeAssets = req.query.excludeAssets !== 'false'; // default true
+    const internalOnly = req.query.internalOnly !== 'false';
+    const excludeAssets = req.query.excludeAssets !== 'false';
 
-    // ── Validate URL ─────────────────────────────────────────────
     if (!url || typeof url !== 'string') {
       res.status(400).json({ success: false, error: 'Missing "url" query parameter' });
       return;
@@ -107,10 +299,8 @@ router.get('/stream', async (req: Request, res: Response) => {
       return;
     }
 
-    // ── Acquire semaphore slot ───────────────────────────────────
-    await acquireMuffetSlot();
+    activeProcessing++;
 
-    // ── SSE setup ────────────────────────────────────────────────
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -118,7 +308,6 @@ router.get('/stream', async (req: Request, res: Response) => {
       'X-Accel-Buffering': 'no',
     });
 
-    // Disable socket timeout for this long-lived streaming connection
     req.socket.setTimeout(0);
     req.socket.setNoDelay(true);
 
@@ -130,7 +319,7 @@ router.get('/stream', async (req: Request, res: Response) => {
       if (child && !child.killed) {
         try { child.kill('SIGTERM'); } catch { /* ignore */ }
       }
-      releaseMuffetSlot();
+      activeProcessing = Math.max(0, activeProcessing - 1);
     }
 
     req.on('close', cleanup);
@@ -142,23 +331,17 @@ router.get('/stream', async (req: Request, res: Response) => {
       }
     }
 
-    // ── Send start event ─────────────────────────────────────────
     const startTime = Date.now();
     sendSSE('start', {
       url,
+      queueStats: getQueueStats(),
       message: 'Muffet crawl started',
       timestamp: startTime,
     });
 
-    // ── Build asset/wp exclude pattern ───────────────────────────
-    //     muffet has NO --include flag — only -e/--exclude.
-    //     Hostname restriction is NOT done via regex (Go's RE2 engine
-    //     doesn't support negative lookaheads). Instead, external URLs
-    //     are filtered out in post-processing below.
     const hostname = new URL(url).hostname;
     const excludePattern = excludeAssets ? buildAssetExcludePattern() : undefined;
 
-    // ── DEBUG: log pattern before spawning ───────────────────────
     console.log('');
     console.log('══════════════════════════════════════════════════════');
     console.log('[MUFFET-SSE] URL:', url);
@@ -167,19 +350,15 @@ router.get('/stream', async (req: Request, res: Response) => {
     console.log('══════════════════════════════════════════════════════');
     console.log('');
 
-    // ── Spawn muffet process ─────────────────────────────────────
     const child = MuffetCrawler.spawnStream(url, undefined, undefined, undefined, excludePattern);
     const stdoutLines: string[] = [];
     let urlsChecked = 0;
     let currentUrl = '';
-    /** Buffer for partial lines that span across chunk boundaries */
     let lineBuffer = '';
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      // Prepend any leftover partial line from the previous chunk
       const text = lineBuffer + chunk.toString();
       const lines = text.split('\n');
-      // The last element may be an incomplete line; save it for the next chunk
       lineBuffer = lines.pop() ?? '';
 
       for (const line of lines) {
@@ -189,7 +368,6 @@ router.get('/stream', async (req: Request, res: Response) => {
         stdoutLines.push(line);
 
         if (line.startsWith('\t')) {
-          // Tab-indented line: result entry (status + linked URL)
           const parts = trimmed.split('\t');
           if (parts.length >= 2) {
             const statusStr = parts[0]!;
@@ -200,7 +378,6 @@ router.get('/stream', async (req: Request, res: Response) => {
             }
           }
         } else {
-          // Non-tab line: URL currently being checked
           urlsChecked++;
           currentUrl = trimmed;
           sendSSE('progress', {
@@ -213,18 +390,15 @@ router.get('/stream', async (req: Request, res: Response) => {
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      // Muffet may send warnings to stderr — log them server-side only
       const text = chunk.toString();
       text.split('\n').filter(l => l.trim()).forEach(line => {
         console.error(`[muffet stderr] ${line.trim()}`);
       });
     });
 
-    // ── Process exit ─────────────────────────────────────────────
     child.on('close', (exitCode) => {
       if (aborted) return;
 
-      // Flush any remaining partial line in the buffer
       if (lineBuffer) {
         const trimmed = lineBuffer.trim();
         if (trimmed) {
@@ -244,14 +418,10 @@ router.get('/stream', async (req: Request, res: Response) => {
         }
       }
 
-      // Parse collected stdout for final results
       let results = parseVerboseOutput(stdoutLines);
       const elapsedSec = Number(((Date.now() - startTime) / 1000).toFixed(2));
 
-      // Post-process: apply additional filtering (safety net)
       if (results.length > 0) {
-        // Filter out external domains if internalOnly is true
-        // (safety net in case the -i include flag misses some)
         if (internalOnly) {
           results = results.filter((r) => {
             try {
@@ -261,19 +431,14 @@ router.get('/stream', async (req: Request, res: Response) => {
             }
           });
         }
-        // Filter out asset URLs, WP paths, feeds, etc.
         if (excludeAssets) {
           results = filterPageRoutes(results);
         }
       }
 
-      // muffet exits with code 0 (all OK) or code 1 (some links errored).
-      // Both produce valid crawl results — only treat as failure if
-      // the process was killed or produced no output.
       const hasResults = results.length > 0;
       const success = hasResults;
 
-      // Debug logging when results are unexpectedly empty
       if (!hasResults) {
         console.error(
           `[muffet] No results parsed. exitCode=${exitCode}, stdoutLines=${stdoutLines.length}`
@@ -297,7 +462,7 @@ router.get('/stream', async (req: Request, res: Response) => {
       });
 
       res.end();
-      releaseMuffetSlot();
+      activeProcessing = Math.max(0, activeProcessing - 1);
     });
 
     child.on('error', (err: Error) => {
@@ -307,11 +472,11 @@ router.get('/stream', async (req: Request, res: Response) => {
         errorType: 'process_error',
       });
       res.end();
-      releaseMuffetSlot();
+      activeProcessing = Math.max(0, activeProcessing - 1);
     });
 
   } catch (err) {
-    releaseMuffetSlot();
+    activeProcessing = Math.max(0, activeProcessing - 1);
     if (!res.headersSent) {
       res.status(500).json({ success: false, error: 'Internal server error during SSE setup' });
     } else {
@@ -321,13 +486,25 @@ router.get('/stream', async (req: Request, res: Response) => {
   }
 });
 
-// ─── POST /api/muffet/crawl ──────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════
+//  POST /api/muffet/crawl  (queue-based — NEVER returns 429)
+// ═════════════════════════════════════════════════════════════════════
+//
+// Behavior:
+//   1. Validate URL (400 if invalid)
+//   2. Check queue capacity (503 if MUFFET_MAX_QUEUE_SIZE exceeded)
+//   3. Create job entry with unique jobId
+//   4. Return 202 Accepted with { status: "queued", jobId, position, ... }
+//   5. Process in background via PQueue
+//
+// The client can use GET /api/muffet/queue/:jobId (SSE) to track their
+// position live, or simply wait and check queue-status periodically.
 
 router.post('/crawl', async (req: Request, res: Response) => {
   try {
     const { url, concurrency, internalOnly, excludeAssets } = req.body;
 
-    // ── Validate URL ─────────────────────────────────────────────
+    // ── 1. Validate URL ──────────────────────────────────────────
     if (!url || typeof url !== 'string') {
       res.status(400).json({
         success: false,
@@ -344,37 +521,114 @@ router.post('/crawl', async (req: Request, res: Response) => {
       return;
     }
 
-    // ── Acquire semaphore slot (wait if at capacity) ─────────────
-    await acquireMuffetSlot();
+    // ── 2. Check queue capacity (safety valve) ───────────────────
+    //      Prevents unbounded memory growth on StackHost's 512MB RAM.
+    const currentQueued = crawlQueue.size;
+    if (currentQueued >= MUFFET_MAX_QUEUE_SIZE) {
+      console.warn(
+        `[MUFFET-QUEUE] ⛔ Queue full (${currentQueued}/${MUFFET_MAX_QUEUE_SIZE}). ` +
+        `Rejecting crawl for ${url}`
+      );
+      res.status(503).json({
+        status: 'rejected',
+        error: 'Server at capacity. Please try again in a few minutes.',
+        queueStats: getQueueStats(),
+      });
+      return;
+    }
 
-    // ── Run muffet crawl ─────────────────────────────────────────
-    const crawler = new MuffetCrawler();
-    const result = await crawler.crawl({
+    // ── 3. Create job entry ──────────────────────────────────────
+    const jobId = crypto.randomUUID();
+    const emitter = new EventEmitter();
+
+    const job: JobInfo = {
+      jobId,
       url,
-      concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : undefined,
-      internalOnly: internalOnly !== false, // default true
-      excludeAssets: excludeAssets !== false, // default true
+      status: 'queued',
+      position: 0, // will be set after add
+      createdAt: Date.now(),
+      emitter,
+    };
+
+    // Calculate position: current queue depth + 1
+    const queuePosition = crawlQueue.size + crawlQueue.pending + 1;
+    job.position = queuePosition;
+
+    jobs.set(jobId, job);
+
+    console.log(
+      `[MUFFET-QUEUE] 📥 Queued ${url} | jobId: ${jobId.slice(0, 8)}… | ` +
+      `position: ${queuePosition} | queue: ${crawlQueue.size}/${MUFFET_MAX_QUEUE_SIZE}`
+    );
+
+    // ── 4. Send 202 Accepted immediately ─────────────────────────
+    res.status(202).json({
+      status: 'queued',
+      jobId,
+      queuePosition,
+      message: `Request accepted and queued. Position: ${queuePosition}. Currently processing: ${activeProcessing}, waiting: ${crawlQueue.size}. Use GET /api/muffet/queue/${jobId} for live SSE position tracking.`,
+      queueStats: getQueueStats(),
     });
 
-    // Release semaphore slot
-    releaseMuffetSlot();
+    // ── 5. Queue the crawl in background ─────────────────────────
+    crawlQueue.add(async () => {
+      // ── Mark as processing ────────────────────────────────────
+      job.status = 'processing';
+      activeProcessing++;
+      job.emitter.emit('started');
 
-    // ── Send response ────────────────────────────────────────────
-    res.json(result);
+      try {
+        const crawler = new MuffetCrawler();
+        const result = await crawler.crawl({
+          url,
+          concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : undefined,
+          internalOnly: internalOnly !== false,
+          excludeAssets: excludeAssets !== false,
+        });
+
+        job.status = 'completed';
+        console.log(
+          `[MUFFET-QUEUE] ✅ Completed ${jobId.slice(0, 8)}… for ${url} | ` +
+          `${result.totalPages} pages in ${result.durationSec}s | ` +
+          `Queue: ${crawlQueue.size} waiting, ${activeProcessing - 1} processing`
+        );
+      } catch (err) {
+        job.status = 'failed';
+        console.error(`[MUFFET-QUEUE] ❌ Failed ${jobId.slice(0, 8)}… for ${url}:`, err);
+      } finally {
+        activeProcessing = Math.max(0, activeProcessing - 1);
+        job.emitter.emit('completed', { status: job.status });
+        // Remove listeners to allow GC
+        setTimeout(() => job.emitter.removeAllListeners(), 1000);
+        // Broadcast new positions to remaining queued jobs
+        broadcastPositionUpdates();
+      }
+    });
+
   } catch (err) {
-    // If we acquired a slot, make sure we release it
-    releaseMuffetSlot();
-
-    console.error('Muffet crawl error:', err);
-    res.status(500).json({
-      success: false,
-      engine: 'muffet',
-      totalPages: 0,
-      results: [],
-      error: err instanceof Error ? err.message : 'Internal server error',
-      errorType: 'process_error',
-    });
+    console.error('Muffet queue error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        engine: 'muffet',
+        totalPages: 0,
+        results: [],
+        error: err instanceof Error ? err.message : 'Internal server error',
+        errorType: 'process_error',
+      });
+    }
   }
+});
+
+// ═════════════════════════════════════════════════════════════════════
+//  GET /api/muffet/queue-status  (poll-based queue monitoring)
+// ═════════════════════════════════════════════════════════════════════
+
+router.get('/queue-status', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    ...getQueueStats(),
+  });
 });
 
 export default router;
