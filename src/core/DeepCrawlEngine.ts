@@ -61,6 +61,9 @@ export interface DeepCrawlOptions {
 
 // ─── Constants ────────────────────────────────────────────────────────
 
+/** Max pages to crawl concurrently (2 = balanced speed vs stability) */
+const CONCURRENT_PAGES = 2;
+
 const CHALLENGE_URL_PATTERNS = [
   'sgcaptcha', '_challenge', 'cf-browser-verification',
   'cloudflare', 'captcha', '.well-known/captcha',
@@ -177,42 +180,53 @@ export class DeepCrawlEngine {
           return this.makeResult(mode, startTime, false, 'timeout');
         }
 
-        const item = queue.shift()!;
-        if (this.visited.has(item.url)) continue;
-        if (item.depth > maxDepth) continue;
+        // Process up to CONCURRENT_PAGES pages in parallel
+        const batchSize = Math.min(CONCURRENT_PAGES, queue.length, maxPages - this.pages.length);
+        const batch = queue.splice(0, batchSize);
 
-        this.visited.add(item.url);
+        const batchResults = await Promise.all(
+          batch.map(async (item) => {
+            if (this.visited.has(item.url)) return null;
+            if (item.depth > maxDepth) return null;
 
-        // Report progress
-        onProgress?.({
-          stage: 'crawling',
-          url: item.url,
-          pagesFound: this.visited.size,
-          pagesCrawled: this.pages.length,
-          elapsedMs: Math.round(performance.now() - startTime),
-          mode,
-        });
+            this.visited.add(item.url);
 
-        // Crawl this page
-        const pageResult = await this.crawlPage(item.url, item.depth, mode === 'bypass', Math.min(remaining, requestTimeoutMs));
+            // Report progress
+            onProgress?.({
+              stage: 'crawling',
+              url: item.url,
+              pagesFound: this.visited.size,
+              pagesCrawled: this.pages.length,
+              elapsedMs: Math.round(performance.now() - startTime),
+              mode,
+            });
 
-        if (!pageResult) continue;
+            // Crawl this page
+            const pageResult = await this.crawlPage(item.url, item.depth, mode === 'bypass', Math.min(remaining / batchSize, requestTimeoutMs));
+            return { item, pageResult };
+          }),
+        );
 
-        // Check if it was a captcha page
-        if (pageResult.isChallenge) {
-          captchaDetected = true;
-          if (pageResult.challengeBypassed) {
-            captchaBypassed = true;
+        for (const result of batchResults) {
+          if (!result || !result.pageResult) continue;
+
+          const { item, pageResult } = result;
+
+          // Check if it was a captcha page
+          if (pageResult.isChallenge) {
+            captchaDetected = true;
+            if (pageResult.challengeBypassed) {
+              captchaBypassed = true;
+            }
           }
-          // Still add the page if we got content
-        }
 
-        this.pages.push(pageResult.page);
+          this.pages.push(pageResult.page);
 
-        // Add discovered links to queue
-        for (const link of pageResult.links) {
-          if (!this.visited.has(link)) {
-            queue.push({ url: link, depth: item.depth + 1, parentUrl: item.url });
+          // Add discovered links to queue
+          for (const link of pageResult.links) {
+            if (!this.visited.has(link)) {
+              queue.push({ url: link, depth: item.depth + 1, parentUrl: item.url });
+            }
           }
         }
 
@@ -288,15 +302,15 @@ export class DeepCrawlEngine {
         return null;
       }
 
-      // Brief pause for async redirects
-      await page.waitForTimeout(1000);
+      // Brief pause for async redirects (reduced from 1000ms)
+      await page.waitForTimeout(300);
 
       let currentUrl = page.url();
       let pageTitle = await page.title().catch(() => '');
       let isChallenge = this.detectChallenge(currentUrl, pageTitle);
 
-      // Wait for network idle and re-check
-      await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+      // Wait for network idle and re-check (reduced from 15s)
+      await page.waitForLoadState('networkidle', { timeout: 8_000 }).catch(() => {});
       currentUrl = page.url();
       pageTitle = await page.title().catch(() => '');
       isChallenge = this.detectChallenge(currentUrl, pageTitle);
@@ -343,13 +357,13 @@ export class DeepCrawlEngine {
 
   /**
    * Wait for a security challenge page to redirect/complete.
-   * Polls every 2s up to 30s (bypass mode) or 15s (standard).
+   * Polls every 2s up to 20s (reduced from 30s).
    */
   private async waitForChallengeBypass(
     playwrightPage: any,
     originalUrl: string,
   ): Promise<boolean> {
-    const maxWaitMs = 30_000;
+    const maxWaitMs = 20_000;
     const pollInterval = 2000;
     let waited = 0;
 

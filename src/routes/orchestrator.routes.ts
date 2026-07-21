@@ -1,6 +1,9 @@
 /**
  * orchestrator.routes.ts — Express router for the Smart Crawl Orchestrator.
  *
+ * All orchestrator crawl requests are routed through the same adaptive PQueue
+ * as muffet crawls, sharing a single concurrency pool (base 5 / boost 10).
+ *
  * Endpoints:
  *   POST /api/orchestrator/crawl   → Trigger smart crawl (returns JSON)
  *   GET  /api/orchestrator/stream   → SSE progress stream (real-time updates)
@@ -8,6 +11,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import { SmartCrawlOrchestrator, type OrchestratorProgress } from '../core/SmartCrawlOrchestrator.js';
+import { crawlQueue, recordCrawlRequest } from './muffet.routes.js';
 
 const router = Router();
 
@@ -16,7 +20,7 @@ const router = Router();
 // cancel the crawl when the client disconnects.
 const activeControllers = new Map<string, AbortController>();
 
-// ─── POST /crawl — Trigger smart crawl ────────────────────────────────
+// ─── POST /crawl — Trigger smart crawl (queued) ──────────────────────
 interface CrawlBody {
   url?: string;
 }
@@ -47,19 +51,24 @@ router.post('/crawl', async (req: Request, res: Response) => {
     return;
   }
 
+  // ── Record for adaptive concurrency ──────────────────────────────
+  recordCrawlRequest();
+
+  // ── Queue the orchestrator crawl (shares pool with muffet) ───────
   const requestId = `orchestrator-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const abortController = new AbortController();
   activeControllers.set(requestId, abortController);
 
   try {
-    const orchestrator = new SmartCrawlOrchestrator();
-
-    const result = await orchestrator.crawl({
-      url: parsed.toString(),
-      signal: abortController.signal,
-      onProgress: (_progress: OrchestratorProgress) => {
-        // Progress is handled via SSE stream — noop for POST response
-      },
+    const result = await crawlQueue.add(async () => {
+      const orchestrator = new SmartCrawlOrchestrator();
+      return orchestrator.crawl({
+        url: parsed.toString(),
+        signal: abortController.signal,
+        onProgress: (_progress: OrchestratorProgress) => {
+          // Progress is handled via SSE stream — noop for POST response
+        },
+      });
     });
 
     res.json(result);
@@ -74,7 +83,7 @@ router.post('/crawl', async (req: Request, res: Response) => {
   }
 });
 
-// ─── GET /stream — SSE progress stream ────────────────────────────────
+// ─── GET /stream — SSE progress stream (queued) ──────────────────────
 interface StreamQuery {
   url?: string;
 }
@@ -105,10 +114,17 @@ router.get('/stream', (req: Request, res: Response) => {
     return;
   }
 
-  // ── SSE setup ─────────────────────────────────────────────────────
+  // ── Record for adaptive concurrency ──────────────────────────────
+  recordCrawlRequest();
+
+  // ── SSE setup ────────────────────────────────────────────────────
   const requestId = `orchestrator-sse-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const abortController = new AbortController();
   activeControllers.set(requestId, abortController);
+
+  // Cancellation flag — if client disconnects while waiting in queue,
+  // the task becomes a fast no-op instead of starting a wasted crawl.
+  let cancelled = false;
 
   // SSE headers
   res.writeHead(200, {
@@ -121,28 +137,34 @@ router.get('/stream', (req: Request, res: Response) => {
   // Send SSE comment to confirm connection
   res.write(':ok\n\n');
 
-  // Handle client disconnect
+  // Handle client disconnect — abort running crawl, cancel queued task
   req.on('close', () => {
+    cancelled = true;
     abortController.abort();
     activeControllers.delete(requestId);
   });
 
-  // ── Run orchestrator with SSE progress ────────────────────────────
-  const orchestrator = new SmartCrawlOrchestrator();
+  // ── Queue the orchestrator crawl with SSE progress ───────────────
+  crawlQueue
+    .add(async () => {
+      // If client disconnected while waiting in queue, skip
+      if (cancelled) return;
 
-  orchestrator
-    .crawl({
-      url: parsed.toString(),
-      signal: abortController.signal,
-      onProgress: (progress: OrchestratorProgress) => {
-        if (!res.writableEnded) {
-          const data = JSON.stringify(progress);
-          res.write(`event: progress\ndata: ${data}\n\n`);
-        }
-      },
+      const orchestrator = new SmartCrawlOrchestrator();
+
+      return orchestrator.crawl({
+        url: parsed.toString(),
+        signal: abortController.signal,
+        onProgress: (progress: OrchestratorProgress) => {
+          if (!res.writableEnded && !cancelled) {
+            const data = JSON.stringify(progress);
+            res.write(`event: progress\ndata: ${data}\n\n`);
+          }
+        },
+      });
     })
     .then((finalResult) => {
-      if (!res.writableEnded) {
+      if (!res.writableEnded && !cancelled) {
         // Send final result as a separate event
         const data = JSON.stringify(finalResult);
         res.write(`event: complete\ndata: ${data}\n\n`);
@@ -150,7 +172,7 @@ router.get('/stream', (req: Request, res: Response) => {
       }
     })
     .catch((err) => {
-      if (!res.writableEnded) {
+      if (!res.writableEnded && !cancelled) {
         const errorPayload = JSON.stringify({
           success: false,
           error: err instanceof Error ? err.message : String(err),
@@ -164,7 +186,7 @@ router.get('/stream', (req: Request, res: Response) => {
     });
 });
 
-// ─── GET /stats — Orchestrator cache stats ────────────────────────────
+// ─── GET /stats — Orchestrator cache stats ───────────────────────────
 import { protectionCache } from '../core/ProtectionCache.js';
 
 router.get('/stats', (_req: Request, res: Response) => {

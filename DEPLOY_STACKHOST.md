@@ -35,14 +35,16 @@ ALLOWED_ORIGINS=https://your-frontend.com,https://admin.your-frontend.com
 
 ### 1.4 (Optional) Tune Queue Settings
 
-These are already set for 512MB RAM:
+These are already set for 512MB RAM. The system uses **adaptive concurrency** — it automatically adjusts between boost mode (10 simultaneous crawls) when load is low, and base mode (5) when traffic spikes.
 
 | Variable | Value | Meaning |
 |----------|-------|---------|
-| `MUFFET_MAX_CONCURRENCY` | 5 | Max simultaneous crawls |
-| `MUFFET_MAX_QUEUE_SIZE` | 200 | Safety valve (HTTP 503 when full) |
-| `MUFFET_DEFAULT_CONCURRENCY` | 10 | Links checked in parallel per crawl |
-
+| `MUFFET_MAX_CONCURRENCY` | `5` | Base — simultaneous crawls when load ≥50 req/min |
+| `MUFFET_BOOST_CONCURRENCY` | `10` | Boost — simultaneous crawls when load <50 req/min |
+| `MUFFET_BOOST_THRESHOLD` | `50` | Request-rate threshold to trigger base vs boost |
+| `MUFFET_RATE_WINDOW_MS` | `60000` | Sliding window (ms) for counting request rate |
+| `MUFFET_MAX_QUEUE_SIZE` | `200` | Safety valve (HTTP 503 when full) |
+| `MUFFET_DEFAULT_CONCURRENCY` | `10` | Links checked in parallel per crawl (per-crawl speed) |
 ---
 
 ## 2. StackHost Setup
@@ -91,9 +93,12 @@ In StackHost Panel → **Environment Variables**, add:
 | `PORT` | `3000` | Or StackHost's assigned port |
 | `CRAWLER_API_KEY` | *(your generated key)* | Must match frontend |
 | `ALLOWED_ORIGINS` | *(your domain)* | |
-| `MUFFET_MAX_CONCURRENCY` | `5` | |
+| `MUFFET_MAX_CONCURRENCY` | `5` | Base concurrency (high load) |
+| `MUFFET_BOOST_CONCURRENCY` | `10` | Boosted concurrency (low load) |
+| `MUFFET_BOOST_THRESHOLD` | `50` | Requests/min threshold for boost |
+| `MUFFET_RATE_WINDOW_MS` | `60000` | Sliding window (ms) for rate counting |
 | `MUFFET_MAX_QUEUE_SIZE` | `200` | |
-| `MUFFET_DEFAULT_CONCURRENCY` | `10` | |
+| `MUFFET_DEFAULT_CONCURRENCY` | `10` | Per-crawl link parallelism |
 
 Alternatively, upload your `.env` file via FTP (it's in `.gitignore` so it won't be committed).
 
@@ -179,18 +184,27 @@ Returns:
   "queueLength": 3,
   "pendingCount": 0,
   "activeProcessing": 2,
-  "maxConcurrency": 5,
+  "maxConcurrency": 10,
+  "boostConcurrency": 10,
+  "baseConcurrency": 5,
+  "boostThreshold": 50,
+  "recentRequests": 3,
   "maxQueueSize": 200
 }
 ```
+> `maxConcurrency` reflects the **current** adaptive value — it will be `10` (boost) when load is low, and `5` (base) when load is high. The `recentRequests` field shows how many crawl requests were received in the last sliding window (default 60s).
 
 ### 4.3 Memory Monitoring
 
 If you see high memory usage in StackHost Panel:
 
-1. Reduce `MUFFET_MAX_CONCURRENCY` → 3
-2. Reduce `MUFFET_MAX_QUEUE_SIZE` → 100
-3. Restart: `pm2 restart seo-utilities-api`
+1. Reduce `MUFFET_MAX_CONCURRENCY` → 3 (lowers base)
+2. Reduce `MUFFET_BOOST_CONCURRENCY` → 5 (lowers boost ceiling)
+3. Reduce `MUFFET_BOOST_THRESHOLD` → 20 (switch to base sooner)
+4. Reduce `MUFFET_MAX_QUEUE_SIZE` → 100
+5. Restart: `pm2 restart seo-utilities-api`
+
+> The adaptive system will automatically use the lower base concurrency (3) during traffic spikes, only boosting to 5 when the queue is nearly empty.
 
 ---
 
@@ -227,11 +241,12 @@ Check logs:
 ```bash
 pm2 logs seo-utilities-api --lines 50
 ```
-
 If you see `FATAL ERROR: Reached heap limit`, reduce concurrency in `.env`:
 
 ```
 MUFFET_MAX_CONCURRENCY=3
+MUFFET_BOOST_CONCURRENCY=5
+MUFFET_BOOST_THRESHOLD=20
 MUFFET_MAX_QUEUE_SIZE=100
 ```
 
@@ -240,6 +255,9 @@ Then restart:
 ```bash
 pm2 restart seo-utilities-api
 ```
+
+> The adaptive system will respect these lower limits — base 3 during spikes, boost 5 during idle periods.
+
 
 ---
 
@@ -254,5 +272,5 @@ pm2 restart seo-utilities-api
 | `install-muffet.mjs` | Downloads muffet binary to `./bin/` |
 | `bin/muffet` | muffet binary (Linux, installed by postinstall) |
 | `logs/` | PM2 log files (auto-created) |
-| `src/routes/muffet.routes.ts` | Queue system with PQueue + SSE |
-| `src/routes/orchestrator.routes.ts` | Smart Crawl (Playwright) |
+| `src/routes/muffet.routes.ts` | PQueue + adaptive concurrency (exports `crawlQueue` for orchestrator) |
+| `src/routes/orchestrator.routes.ts` | Smart Crawl (Playwright) — shares `crawlQueue` from muffet routes |

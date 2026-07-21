@@ -11,6 +11,8 @@
  *
  * ─── Key Features ─────────────────────────────────────────────────────
  *   • Pre-detection of security protections (Cloudflare, SiteGround, etc.)
+ *   • DETECTION-BASED ROUTING: pre-detection result directly picks best
+ *     starting attempt (bypass for Cloudflare, standard for Sucuri, etc.)
  *   • 24h in-memory cache to skip failed attempts for known-protected domains
  *   • 8-minute total timeout budget with honest failure reporting
  *   • attemptsLog array for full transparency
@@ -94,12 +96,12 @@ export interface OrchestratorOptions {
 
 // ─── Constants ────────────────────────────────────────────────────────
 
-const DEFAULT_TOTAL_TIMEOUT_MS = 8 * 60 * 1000; // 8 minutes
-const MUFFET_DEFAULT_CONCURRENCY = 10;
-const DEEP_CRAWL_MAX_PAGES = 50;
-const DEEP_CRAWL_MAX_DEPTH = 3;
-const DEEP_CRAWL_TIMEOUT_STANDARD_MS = 90_000; // 90s per page
-const DEEP_CRAWL_TIMEOUT_BYPASS_MS = 180_000; // 180s per page
+const DEFAULT_TOTAL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes (was 8min)
+const MUFFET_DEFAULT_CONCURRENCY = 15;          // Increased from 10 for faster parallel checks
+const DEEP_CRAWL_MAX_PAGES = 25;                // Reduced from 50 — sufficient for analysis
+const DEEP_CRAWL_MAX_DEPTH = 2;                 // Reduced from 3 — fewer hops, faster results
+const DEEP_CRAWL_TIMEOUT_STANDARD_MS = 45_000; // 45s per page (was 90s)
+const DEEP_CRAWL_TIMEOUT_BYPASS_MS = 90_000;   // 90s per page (was 180s)
 
 // ─── Orchestrator ─────────────────────────────────────────────────────
 
@@ -185,17 +187,35 @@ export class SmartCrawlOrchestrator {
       emitProgress('cache-check', 'Checking protection cache...');
       const cached = protectionCache.get(url);
       let skipToBypass = false;
+      let detectionStrategy: 'muffet' | 'deep-crawl-standard' | 'deep-crawl-bypass' = 'muffet';
 
       if (cached) {
         if (cached.recommendedStrategy === 'deep-crawl-bypass') {
           skipToBypass = true;
+          detectionStrategy = 'deep-crawl-bypass';
           emitProgress('cache-check', `Cache HIT for ${cached.hostname} — skipping to bypass mode (previous bypass ${cached.bypassEverSucceeded ? 'succeeded' : 'failed'})`);
         } else {
+          detectionStrategy = cached.recommendedStrategy as 'muffet' | 'deep-crawl-standard' | 'deep-crawl-bypass';
           emitProgress('cache-check', `Cache HIT for ${cached.hostname} — recommended strategy: ${cached.recommendedStrategy}`);
         }
       } else {
-        emitProgress('cache-check', 'No cached data — will attempt full escalation chain');
+        // ══════════════════════════════════════════════════════════════════
+        // Detection-Based Routing: use pre-detection result to pick the
+        // best starting attempt instead of always starting from Muffet.
+        // ══════════════════════════════════════════════════════════════════
+        detectionStrategy = this.pickStrategyFromDetection(detection);
+        if (detectionStrategy === 'deep-crawl-bypass') {
+          skipToBypass = true;
+          emitProgress('cache-check', `Detection-based routing: ${detection?.provider || 'Unknown protection'} detected → starting from bypass mode`);
+        } else if (detectionStrategy === 'deep-crawl-standard') {
+          emitProgress('cache-check', `Detection-based routing: ${detection?.provider || 'Generic protection'} detected → starting from deep-crawl standard`);
+        } else {
+          emitProgress('cache-check', `Detection-based routing: no protection detected → starting from Muffet fast-crawl`);
+        }
       }
+
+      // Determine starting attempt based on cache + detection
+      const startFromAttempt: 1 | 2 | 3 = skipToBypass ? 3 : (detectionStrategy === 'deep-crawl-standard' ? 2 : 1);
 
       // ══════════════════════════════════════════════════════════════════
       // STEP 3: Escalation Chain
@@ -205,8 +225,8 @@ export class SmartCrawlOrchestrator {
       let deepCrawlStandardResult: DeepCrawlResult | null = null;
       let deepCrawlBypassResult: DeepCrawlResult | null = null;
 
-      // ── Attempt 1: Muffet (skip if cache says bypass) ───────────────
-      if (!skipToBypass) {
+      // ── Attempt 1: Muffet (skipped if cache/detection says bypass or standard) ──
+      if (startFromAttempt <= 1) {
         const attemptStart = performance.now();
         emitProgress('attempt-1-muffet', 'Attempt 1/3: Muffet fast-crawl starting...');
 
@@ -265,13 +285,16 @@ export class SmartCrawlOrchestrator {
           return this.buildFinalResult(url, startTime, false, attemptsLog, detection, muffetResult, null, null, 'Timeout: 8-minute budget exhausted after Muffet attempt');
         }
       } else {
-        // Cache said bypass — log skipped
-        logAttempt(1, 'muffet', 'skipped', `Cache recommends bypass — skipping Muffet`, 0, 0);
-        emitProgress('attempt-1-muffet', 'Skipping Muffet (cache recommends bypass mode)');
+        // Skipped by cache or detection-based routing
+        const skipReason = skipToBypass
+          ? `Cache recommends bypass — skipping Muffet`
+          : `Detection recommends ${detectionStrategy} — skipping Muffet`;
+        logAttempt(1, 'muffet', 'skipped', skipReason, 0, 0);
+        emitProgress('attempt-1-muffet', skipReason);
       }
 
-      // ── Attempt 2: Deep-Crawl Standard (skip if cache says bypass) ──
-      if (!skipToBypass) {
+      // ── Attempt 2: Deep-Crawl Standard (skip if detection/cache says bypass) ──
+      if (startFromAttempt <= 2) {
         const attemptStart = performance.now();
         emitProgress('attempt-2-deep-crawl-standard', 'Attempt 2/3: Deep-Crawl standard mode (JS rendering)...');
 
@@ -326,8 +349,11 @@ export class SmartCrawlOrchestrator {
           return this.buildFinalResult(url, startTime, false, attemptsLog, detection, muffetResult, deepCrawlStandardResult, null, 'Timeout: 8-minute budget exhausted after Deep-Crawl standard attempt');
         }
       } else {
-        logAttempt(2, 'deep-crawl-standard', 'skipped', `Cache recommends bypass — skipping standard deep-crawl`, 0, 0);
-        emitProgress('attempt-2-deep-crawl-standard', 'Skipping Deep-Crawl standard (cache recommends bypass mode)');
+        const skipReason2 = skipToBypass
+          ? `Cache/detection recommends bypass — skipping standard deep-crawl`
+          : `Detection recommends deep-crawl-bypass — skipping standard deep-crawl`;
+        logAttempt(2, 'deep-crawl-standard', 'skipped', skipReason2, 0, 0);
+        emitProgress('attempt-2-deep-crawl-standard', skipReason2);
       }
 
       // ── Attempt 3: Deep-Crawl Bypass (LAST RESORT) ──────────────────
@@ -411,6 +437,41 @@ export class SmartCrawlOrchestrator {
       });
       return this.buildFinalResult(url, startTime, false, attemptsLog, detection, null, null, null, errorMsg);
     }
+  }
+
+  /**
+   * Pick the best starting crawl strategy based on pre-detection results.
+   *
+   * Provider → Strategy mapping:
+   *   Cloudflare, SiteGround, DataDome, PerimeterX → bypass (stealth required)
+   *   Sucuri, Wordfence, Akamai                    → standard (JS rendering works)
+   *   No protection / unknown                       → muffet (fastest)
+   */
+  private pickStrategyFromDetection(detection: DetectionResult | null): 'muffet' | 'deep-crawl-standard' | 'deep-crawl-bypass' {
+    if (!detection || !detection.protected) {
+      return 'muffet';
+    }
+
+    const provider = detection.provider || '';
+
+    // These providers aggressively block all automated requests — stealth bypass is required
+    const bypassProviders = ['Cloudflare', 'SiteGround', 'DataDome', 'PerimeterX / Human Security'];
+    if (bypassProviders.some(p => provider.includes(p))) {
+      return 'deep-crawl-bypass';
+    }
+
+    // These are WAF-style protections — standard JS rendering can handle them
+    const standardProviders = ['Sucuri', 'Wordfence', 'Akamai (Bot Manager)'];
+    if (standardProviders.some(p => provider.includes(p))) {
+      return 'deep-crawl-standard';
+    }
+
+    // Unknown protection — safe default to bypass
+    if (detection.confidence === 'high' || detection.confidence === 'medium') {
+      return 'deep-crawl-bypass';
+    }
+
+    return 'deep-crawl-standard';
   }
 
   /**

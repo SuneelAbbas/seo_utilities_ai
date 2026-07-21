@@ -11,8 +11,9 @@
  *
  * Memory note (StackHost 512MB RAM):
  *   - max_memory_restart: 400M — restart before OOM killer kicks in
- *   - MUFFET_MAX_CONCURRENCY=5 — 5 muffet processes max
+ *   - Adaptive concurrency: MUFFET_MAX_CONCURRENCY=5 (base) / MUFFET_BOOST_CONCURRENCY=10 (boost)
  *   - MUFFET_MAX_QUEUE_SIZE=200 — safety valve
+ *   - MUFFET_BOOST_THRESHOLD=50 — switches between boost and base
  */
 
 module.exports = {

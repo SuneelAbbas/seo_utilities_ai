@@ -4,6 +4,7 @@ import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import {
   type MuffetResult,
+  type MuffetCrawlResponse,
   MuffetCrawler,
   buildAssetExcludePattern,
   filterPageRoutes,
@@ -18,22 +19,46 @@ const router = Router();
 // ═════════════════════════════════════════════════════════════════════
 
 /**
- * Max muffet processes running in parallel (1–50).
+ * Base (minimum) concurrency — used when load is HIGH (>=50 req/min).
  * env: MUFFET_MAX_CONCURRENCY  (default: 5)
  */
-const MUFFET_QUEUE_CONCURRENCY = Math.max(
+const MUFFET_QUEUE_CONCURRENCY_BASE = Math.max(
   1,
   Math.min(50, Number(process.env.MUFFET_MAX_CONCURRENCY) || 5)
+);
+
+/**
+ * Boosted concurrency — used when load is LOW (<50 req/min).
+ * env: MUFFET_BOOST_CONCURRENCY  (default: 10)
+ */
+const MUFFET_QUEUE_CONCURRENCY_BOOST = Math.max(
+  MUFFET_QUEUE_CONCURRENCY_BASE,
+  Math.min(50, Number(process.env.MUFFET_BOOST_CONCURRENCY) || 10)
+);
+
+/**
+ * Request-rate threshold for concurrency boost.
+ * If requests in the last 60 seconds < this value → use BOOST concurrency.
+ * env: MUFFET_BOOST_THRESHOLD  (default: 50)
+ */
+const MUFFET_BOOST_THRESHOLD = Math.max(
+  1,
+  Number(process.env.MUFFET_BOOST_THRESHOLD) || 50
+);
+
+/**
+ * Sliding window (milliseconds) for counting request rate.
+ * env: MUFFET_RATE_WINDOW_MS  (default: 60_000 = 1 min)
+ */
+const MUFFET_RATE_WINDOW_MS = Math.max(
+  10_000,
+  Number(process.env.MUFFET_RATE_WINDOW_MS) || 60_000
 );
 
 /**
  * Max number of queued (waiting) requests before we return 503.
  * This is a safety valve for extreme bursts (e.g. 1000 req/s).
  * env: MUFFET_MAX_QUEUE_SIZE  (default: 200)
- *
- * With MUFFET_MAX_CONCURRENCY=5 and each crawl taking ~5s average,
- * 200 queue slots = ~200s of backlog = ~40 crawls/minute throughput.
- * On StackHost's 512MB RAM this prevents unbounded memory growth.
  */
 const MUFFET_MAX_QUEUE_SIZE = Math.max(
   10,
@@ -41,11 +66,75 @@ const MUFFET_MAX_QUEUE_SIZE = Math.max(
 );
 
 // ═════════════════════════════════════════════════════════════════════
+//  ADAPTIVE CONCURRENCY — auto-tunes PQueue based on request rate
+// ═════════════════════════════════════════════════════════════════════
+
+/**
+ * Sliding window: timestamps of recent crawl requests.
+ * Used to decide whether to boost or lower concurrency.
+ */
+const requestTimestamps: number[] = [];
+
+/**
+ * Prune timestamps older than the rate window (default: 60s).
+ * Call this before counting to keep the window accurate.
+ */
+function pruneRequestTimestamps() {
+  const cutoff = Date.now() - MUFFET_RATE_WINDOW_MS;
+  while (requestTimestamps.length > 0 && requestTimestamps[0]! < cutoff) {
+    requestTimestamps.shift();
+  }
+}
+
+/**
+ * Count requests in the current sliding window and adjust PQueue concurrency.
+ *
+ * Logic:
+ *   - If < MUFFET_BOOST_THRESHOLD requests in last window → HIGH concurrency (fast)
+ *   - If >= MUFFET_BOOST_THRESHOLD requests in last window → BASE concurrency (safe)
+ *
+ * This lets us be aggressive when load is low (10 parallel crawls)
+ * and conservative when load spikes (5 parallel crawls to protect memory).
+ */
+function updateAdaptiveConcurrency() {
+  pruneRequestTimestamps();
+  const recentCount = requestTimestamps.length;
+  const newConcurrency =
+    recentCount < MUFFET_BOOST_THRESHOLD
+      ? MUFFET_QUEUE_CONCURRENCY_BOOST   // low load → boost (e.g., 10)
+      : MUFFET_QUEUE_CONCURRENCY_BASE;    // high load → base (e.g., 5)
+
+  const oldConcurrency = crawlQueue.concurrency;
+  if (oldConcurrency !== newConcurrency) {
+    crawlQueue.concurrency = newConcurrency;
+    console.log(
+      `[ADAPTIVE] ⚡ Concurrency ${oldConcurrency} → ${newConcurrency} ` +
+      `(${recentCount} req in last ${MUFFET_RATE_WINDOW_MS / 1000}s, ` +
+      `threshold: ${MUFFET_BOOST_THRESHOLD})`
+    );
+  }
+}
+
+/**
+ * Record a new crawl request timestamp and update concurrency.
+ * Called at the start of every POST /api/muffet/crawl request.
+ */
+function recordCrawlRequest() {
+  requestTimestamps.push(Date.now());
+  updateAdaptiveConcurrency();
+}
+
+/** Get the currently active concurrency value */
+function getCurrentConcurrency(): number {
+  return crawlQueue.concurrency;
+}
+
+// ═════════════════════════════════════════════════════════════════════
 //  PQUEUE — FIFO crawl queue
 // ═════════════════════════════════════════════════════════════════════
 
 const crawlQueue = new PQueue({
-  concurrency: MUFFET_QUEUE_CONCURRENCY,
+  concurrency: MUFFET_QUEUE_CONCURRENCY_BOOST, // start with boost (optimistic)
   autoStart: true,
 });
 
@@ -57,7 +146,11 @@ function getQueueStats() {
     queueLength: crawlQueue.size,
     pendingCount: crawlQueue.pending,
     activeProcessing,
-    maxConcurrency: MUFFET_QUEUE_CONCURRENCY,
+    maxConcurrency: getCurrentConcurrency(),   // dynamic!
+    boostConcurrency: MUFFET_QUEUE_CONCURRENCY_BOOST,
+    baseConcurrency: MUFFET_QUEUE_CONCURRENCY_BASE,
+    boostThreshold: MUFFET_BOOST_THRESHOLD,
+    recentRequests: requestTimestamps.length,
     maxQueueSize: MUFFET_MAX_QUEUE_SIZE,
   };
 }
@@ -74,6 +167,8 @@ interface JobInfo {
   createdAt: number;
   /** EventEmitter for streaming position updates to SSE clients */
   emitter: EventEmitter;
+  /** Crawl result — populated when status becomes 'completed' or 'failed' */
+  result: MuffetCrawlResponse | null;
 }
 
 /**
@@ -521,7 +616,12 @@ router.post('/crawl', async (req: Request, res: Response) => {
       return;
     }
 
-    // ── 2. Check queue capacity (safety valve) ───────────────────
+    // ── 2. Record request for adaptive concurrency ───────────────
+    //      Tracks request rate in a sliding window. If <50 req/min
+    //      then PQueue concurrency = 10 (boost). If >=50 then = 5 (base).
+    recordCrawlRequest();
+
+    // ── 3. Check queue capacity (safety valve) ───────────────────
     //      Prevents unbounded memory growth on StackHost's 512MB RAM.
     const currentQueued = crawlQueue.size;
     if (currentQueued >= MUFFET_MAX_QUEUE_SIZE) {
@@ -548,6 +648,7 @@ router.post('/crawl', async (req: Request, res: Response) => {
       position: 0, // will be set after add
       createdAt: Date.now(),
       emitter,
+      result: null, // populated when crawl completes
     };
 
     // Calculate position: current queue depth + 1
@@ -561,17 +662,8 @@ router.post('/crawl', async (req: Request, res: Response) => {
       `position: ${queuePosition} | queue: ${crawlQueue.size}/${MUFFET_MAX_QUEUE_SIZE}`
     );
 
-    // ── 4. Send 202 Accepted immediately ─────────────────────────
-    res.status(202).json({
-      status: 'queued',
-      jobId,
-      queuePosition,
-      message: `Request accepted and queued. Position: ${queuePosition}. Currently processing: ${activeProcessing}, waiting: ${crawlQueue.size}. Use GET /api/muffet/queue/${jobId} for live SSE position tracking.`,
-      queueStats: getQueueStats(),
-    });
-
-    // ── 5. Queue the crawl in background ─────────────────────────
-    crawlQueue.add(async () => {
+    // ── 4. Queue the crawl and WAIT for result ──────────────────
+    const queueTask = crawlQueue.add(async (): Promise<MuffetCrawlResponse> => {
       // ── Mark as processing ────────────────────────────────────
       job.status = 'processing';
       activeProcessing++;
@@ -579,7 +671,7 @@ router.post('/crawl', async (req: Request, res: Response) => {
 
       try {
         const crawler = new MuffetCrawler();
-        const result = await crawler.crawl({
+        const crawlResult = await crawler.crawl({
           url,
           concurrency: typeof concurrency === 'number' && concurrency > 0 ? concurrency : undefined,
           internalOnly: internalOnly !== false,
@@ -587,22 +679,56 @@ router.post('/crawl', async (req: Request, res: Response) => {
         });
 
         job.status = 'completed';
+        job.result = crawlResult;
         console.log(
           `[MUFFET-QUEUE] ✅ Completed ${jobId.slice(0, 8)}… for ${url} | ` +
-          `${result.totalPages} pages in ${result.durationSec}s | ` +
+          `${crawlResult.totalPages} pages in ${crawlResult.durationSec}s | ` +
           `Queue: ${crawlQueue.size} waiting, ${activeProcessing - 1} processing`
         );
+        return crawlResult;
       } catch (err) {
+        const failureResult: MuffetCrawlResponse = {
+          success: false,
+          engine: 'muffet',
+          totalPages: 0,
+          results: [],
+          durationSec: 0,
+          error: err instanceof Error ? err.message : 'Unknown error',
+          errorType: 'process_error',
+        };
         job.status = 'failed';
+        job.result = failureResult;
         console.error(`[MUFFET-QUEUE] ❌ Failed ${jobId.slice(0, 8)}… for ${url}:`, err);
+        return failureResult;
       } finally {
         activeProcessing = Math.max(0, activeProcessing - 1);
-        job.emitter.emit('completed', { status: job.status });
+        job.emitter.emit('completed', { status: job.status, result: job.result });
         // Remove listeners to allow GC
         setTimeout(() => job.emitter.removeAllListeners(), 1000);
         // Broadcast new positions to remaining queued jobs
         broadcastPositionUpdates();
       }
+    });
+
+    // ── 5. Wait for the crawl result (up to 5 min) ──────────────
+    const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+    const result = await Promise.race([
+      queueTask,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Crawl timed out after 5 minutes')), TIMEOUT_MS)
+      ),
+    ]);
+
+    // ── 6. Return the crawl result directly ─────────────────────
+    const responseStatus = result.success ? 200 : 500;
+    res.status(responseStatus).json({
+      success: result.success,
+      jobId,
+      url,
+      result,
+      message: result.success
+        ? `Crawl completed. ${result.totalPages} pages in ${result.durationSec}s.`
+        : `Crawl failed: ${result.error}`,
     });
 
   } catch (err) {
@@ -631,4 +757,65 @@ router.get('/queue-status', (_req: Request, res: Response) => {
   });
 });
 
+// ═════════════════════════════════════════════════════════════════════
+//  GET /api/muffet/result/:jobId  (retrieve completed crawl result)
+// ═════════════════════════════════════════════════════════════════════
+//
+// Returns the full crawl result for a given jobId:
+//   - If status is 'completed' or 'failed': returns the result data
+//   - If status is 'queued' or 'processing': returns 202 with current status
+//   - If jobId not found: returns 404
+
+router.get('/result/:jobId', (req: Request, res: Response) => {
+  const jobId = req.params.jobId as string;
+  const job = jobs.get(jobId);
+
+  if (!job) {
+    res.status(404).json({
+      success: false,
+      error: `Job ${jobId} not found. It may have been purged (jobs kept for 10 min).`,
+    });
+    return;
+  }
+
+  // If still processing, return 202 with current status
+  if (job.status === 'queued' || job.status === 'processing') {
+    res.status(202).json({
+      success: true,
+      status: job.status,
+      jobId: job.jobId,
+      url: job.url,
+      position: job.position,
+      message: job.status === 'queued'
+        ? `Crawl is queued at position ${job.position}.`
+        : 'Crawl is currently processing.',
+      queueStats: getQueueStats(),
+    });
+    return;
+  }
+
+  // Return the stored result
+  const responseStatus = job.result?.success === false ? 500 : 200;
+  res.status(responseStatus).json({
+    success: job.result?.success ?? false,
+    status: job.status,
+    jobId: job.jobId,
+    url: job.url,
+    result: job.result,
+    message: job.status === 'completed'
+      ? 'Crawl completed successfully.'
+      : 'Crawl failed.',
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  EXPORTS
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Named exports so other modules (e.g. orchestrator.routes.ts) can share
+ * the same adaptive PQueue. Both muffet and orchestrator endpoints are
+ * throttled by a single concurrency pool (base 5 / boost 10).
+ */
+export { crawlQueue, recordCrawlRequest, getCurrentConcurrency, getQueueStats };
 export default router;

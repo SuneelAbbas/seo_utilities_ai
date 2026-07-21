@@ -52,11 +52,12 @@ app.get('/api/health', (_req, res) => {
 });
 
 // ─── Muffet routes (auth + abuse prevention, queue-based concurrency) ─
-// Concurrency is managed by PQueue inside muffet.routes.ts — no 429 rejection.
+// Concurrency is managed by the shared adaptive PQueue — no 429 rejection.
 app.use('/api/muffet', apiKeyAuth, abuseLimiter, muffetRouter);
 
-// ─── Orchestrator routes (auth + abuse prevention, queue-based) ─────
-// Concurrency is managed by PQueue inside the orchestrator route.
+// ─── Orchestrator routes (auth + abuse prevention, shared queue) ────
+// Orchestrator shares the SAME adaptive PQueue as muffet, so both
+// endpoints are throttled by a single concurrency pool (base 5 / boost 10).
 app.use('/api/orchestrator', apiKeyAuth, abuseLimiter, orchestratorRouter);
 
 // ─── Error handler (must be last) ────────────────────────────────────
