@@ -10,7 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
     "install:muffet": "node install-muffet.mjs",
-    "postinstall": "node install-muffet.mjs && npx playwright install chromium --with-deps 2>/dev/null || echo '⚠️  Playwright install skipped (not a Linux build environment)'",
+    "postinstall": "node install-muffet.mjs 2>/dev/null || echo '⚠️  Muffet binary download failed (will use system muffet if available)'",
     "deploy:build": "npm install && npm run build",
     "deploy:start": "pm2 start ecosystem.config.cjs --env production || npm start"
   },
@@ -20,13 +20,13 @@
     "express": "^5.2.1",
     "express-rate-limit": "^7.5.0",
     "p-queue": "^9.3.1",
-    "playwright": "^1.61.1"
+    "playwright": "^1.61.1",
+    "tar": "^7.5.20"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^22.7.5",
-    "tar": "^7.5.20",
     "tsx": "^4.19.1",
     "typescript": "^5.6.3"
   },
